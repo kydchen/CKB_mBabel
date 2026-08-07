@@ -26,7 +26,7 @@ ARK_API_KEY=...
 ARK_MODEL=doubao-seed-2-0-lite-260215
 ```
 
-Verified end-to-end on 2026-08-07: ASR hotwords, corrections map, glossary-enforced volc-mt translation in both directions, ~0.5s translation latency after sentence commit.
+Verified end-to-end on 2026-08-08. Translation is three-stage since W1: volc-mt drafts (whole QPM budget, 0.5s debounce) -> the last draft is promoted as the provisional caption at commit (italic ≈) -> an ark refined pass with the previous two sentences as context replaces it in place (falls back to volc-mt without ark credentials).
 
 3. Install (use a venv):
 
