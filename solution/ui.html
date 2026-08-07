@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title> CKB mBabel 双语字幕 </title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    display: flex; flex-direction: column;
+    background: #0d1117; color: #e6edf3;
+    font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+  }
+  header {
+    padding: 10px 18px; font-size: 14px; color: #8b949e;
+    background: #161b22; border-bottom: 1px solid #21262d;
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  }
+  header b { color: #e6edf3; font-size: 16px; }
+  .hbtns { display: flex; gap: 8px; align-items: center; }
+  .hbtn {
+    font-size: 13px; color: #c9d1d9; background: #21262d; border: 1px solid #30363d;
+    border-radius: 6px; padding: 4px 12px; cursor: pointer;
+  }
+  .hbtn:hover { background: #30363d; }
+  #status::before { content: '●'; margin-right: 6px; color: #f85149; }
+  #status.connected::before { color: #3fb950; }
+  .pane { flex: 1; overflow-y: auto; padding: 12px 18px; }
+  #originals { border-bottom: 2px solid #21262d; }
+  .label {
+    font-size: 16px; font-weight: 700; color: #f0f6fc;
+    margin: 2px 2px 10px; padding-left: 10px;
+    border-left: 4px solid #1f6feb; letter-spacing: 1px;
+  }
+  #translations .label { border-left-color: #3fb950; }
+  .label .sub { font-size: 12px; font-weight: 400; color: #8b949e; margin-left: 8px; }
+  .flow { font-size: 21px; line-height: 1.85; }
+  .s { margin-right: 4px; }
+  .sp {
+    font-size: 11px; font-weight: 600; border-radius: 10px;
+    padding: 2px 9px; margin-right: 8px; vertical-align: 3px;
+    white-space: nowrap;
+  }
+  .sp0 { background: #0c2d6b; color: #79c0ff; }
+  .sp1 { background: #4d2d00; color: #ffa657; }
+  .sp2 { background: #3b1f5e; color: #d2a8ff; }
+  .sp3 { background: #063a2f; color: #7ee7c7; }
+  #translations .flow { color: #7ee787; }
+  #translations .s.pending { color: #3f4f45; font-style: italic; }
+  #draft {
+    padding: 10px 14px; margin: 10px 2px 4px; border-radius: 8px;
+    border: 1px dashed #2d4a36; color: #6fcf7f;
+    font-size: 21px; line-height: 1.6; display: none;
+  }
+  .draft-tag {
+    font-size: 13px; font-weight: 700; font-style: normal;
+    color: #0d1117; background: #3fb950; border-radius: 4px;
+    padding: 2px 8px; margin-right: 10px; vertical-align: 2px;
+    white-space: nowrap;
+  }
+  #interim {
+    padding: 12px 18px; font-size: 21px; color: #c9d1d9;
+    line-height: 1.6; min-height: 30px;
+    border-top: 1px dashed #21262d; background: #10141a;
+  }
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55);
+    display: none; align-items: center; justify-content: center; z-index: 10;
+  }
+  .modal-mask.open { display: flex; }
+  .modal {
+    width: min(620px, 92vw); max-height: 84vh; overflow-y: auto;
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 22px 26px; font-size: 15.5px; line-height: 1.8; color: #c9d1d9;
+  }
+  .modal h2 { font-size: 19px; color: #f0f6fc; margin-bottom: 10px; }
+  .modal h3 { font-size: 15.5px; color: #e6edf3; margin: 14px 0 4px; }
+  .modal p { margin: 6px 0; }
+  .modal p.en { color: #8b949e; font-size: 14px; }
+  .modal .k { color: #7ee787; font-weight: 600; }
+  .modal a { color: #58a6ff; }
+  /* ponytail: single-language view is just display:none on .zh/.en, scoped by data-lang */
+  .modal[data-lang="zh"] .en { display: none; }
+  .modal[data-lang="en"] .zh { display: none; }
+  .modal[data-lang="en"] p.en { color: #c9d1d9; font-size: 15.5px; }
+  #lang-btn { float: right; margin-right: 12px; }
+  .modal .close { float: right; cursor: pointer; color: #8b949e; font-size: 20px; }
+  .modal label { display: block; margin: 8px 0; cursor: pointer; font-size: 15.5px; }
+  .modal input[type=text] {
+    width: 100%; background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 6px; padding: 8px 12px; font-size: 15px; margin-top: 2px;
+  }
+  .modal .spk-row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+  .modal .spk-row .sp { flex: none; cursor: pointer; }
+  .modal .spk-row input { flex: 1; }
+  .s.hl { background: #3b2f00; outline: 1px solid #ffa657; border-radius: 4px; }
+  #export-go {
+    margin-top: 14px; width: 100%; padding: 8px; font-size: 15px; font-weight: 600;
+    background: #238636; color: #fff; border: none; border-radius: 8px; cursor: pointer;
+  }
+  #export-go:hover { background: #2ea043; }
+</style>
+</head>
+<body>
+<header>
+  <span><b> CKB mBabel</b> 双语字幕</span>
+  <span class="hbtns">
+    <button class="hbtn" id="share-btn" style="display:none">分享 Share</button>
+    <button class="hbtn" id="info-btn">说明 About</button>
+    <button class="hbtn" id="export-btn">导出 Export</button>
+    <span id="status">connecting…</span>
+  </span>
+</header>
+<div class="pane" id="originals">
+  <div class="label">原文 Original</div>
+  <div class="flow" id="flow-orig"></div>
+</div>
+<div id="interim"></div>
+<div class="pane" id="translations">
+  <div class="label">译文 Translation<span class="sub">AI 精翻 · Refined</span></div>
+  <div class="flow" id="flow-trans"></div>
+  <div id="draft"></div>
+</div>
+
+<div class="modal-mask" id="info-mask">
+  <div class="modal" id="info-box" data-lang="zh">
+    <span class="close" data-close="info-mask">✕</span>
+    <button class="hbtn" id="lang-btn">EN</button>
+    <h2><span class="zh">mBabel 双语字幕 · 说明</span><span class="en">Babel Bilingual Captions · About</span></h2>
+    <h3><span class="zh">界面</span><span class="en">Layout</span></h3>
+    <p class="zh">上半部分是<span class="k">原文 Original</span>:实时语音转写,说话人切换时显示彩色筹码(说话人 1、2…)。</p>
+    <p class="en">Top pane is the <span class="k">Original</span>: live transcript, with a colored chip marking each speaker change (Speaker 1, 2…).</p>
+    <p class="zh">下半部分是<span class="k">译文 Translation(AI 精翻)</span>:完整句子的正式翻译,句号、说话人切换或 3 秒停顿后落定。</p>
+    <p class="en">Bottom pane is the <span class="k">Translation (AI refined)</span>: a proper translation of each full sentence, committed when a sentence ends, the speaker changes, or after 3s of silence.</p>
+    <p class="zh">绿色虚线框 <span class="k">≈ 快速翻译 Quick draft</span>:句子还在说的时候的草稿译文,持续更新,最终被精翻覆盖。先睹为快,不是最终稿。</p>
+    <p class="en">The dashed green box <span class="k">≈ Quick draft</span> is a rough translation that follows speech mid-sentence and keeps updating, then gets replaced by the refined one. Fast, not final.</p>
+    <h3><span class="zh">模型</span><span class="en">Models</span></h3>
+    <p class="zh">识别:豆包流式语音识别 2.0(二遍识别、热词增强、说话人聚类)。翻译:火山引擎机器翻译大模型,术语表逐句注入。</p>
+    <p class="en">ASR: Volcengine Seed-ASR 2.0 (two-pass, hotwords, speaker clustering). Translation: Volcengine MT LLM with per-sentence glossary.</p>
+    <h3><span class="zh">隐私</span><span class="en">Privacy</span></h3>
+    <p class="zh">音频流送往火山引擎做识别和翻译,本地不保存音频;字幕文本只存在这个页面和你导出的文件里。</p>
+    <p class="en">Audio is processed by Volcengine cloud APIs and never stored locally; captions live only in this page and your exported files.</p>
+    <h3>GitHub</h3>
+    <p class="zh">仓库:<a href="https://github.com/kydchen/CKB_mBabel" target="_blank" rel="noopener">kydchen/CKB_mBabel</a></p>
+    <p class="en">Repo: <a href="https://github.com/kydchen/CKB_mBabel" target="_blank" rel="noopener">kydchen/CKB_mBabel</a></p>
+  </div>
+</div>
+
+<div class="modal-mask" id="share-mask">
+  <div class="modal">
+    <span class="close" data-close="share-mask">✕</span>
+    <h2>分享 Share</h2>
+    <p>打开链接的人能看到实时双语字幕,可以在自己浏览器里导出。链接在程序关闭后失效。</p>
+    <p class="en">Anyone with the link watches live bilingual captions and can export from their own browser. Links die when the app stops.</p>
+    <div id="share-links"></div>
+    <p style="color:#8b949e;font-size:13px">注意:拿到公网链接的人即拿到会议字幕全文,请只发给与会者。<br>The public link exposes the full transcript. Share only with attendees.</p>
+  </div>
+</div>
+
+<div class="modal-mask" id="export-mask">
+  <div class="modal">
+    <span class="close" data-close="export-mask">✕</span>
+    <h2>导出 Markdown Export</h2>
+    <label><input type="radio" name="exp-kind" value="original"> 原文 Original only</label>
+    <label><input type="radio" name="exp-kind" value="translation"> 译文 Translation only</label>
+    <label><input type="radio" name="exp-kind" value="bilingual" checked> 双语对照 Original + Translation</label>
+    <h3>说话人命名 Speaker names</h3>
+    <p style="color:#8b949e;font-size:13px">点说话人标签,主屏会跳到并高亮 TA 说过的句子,方便确认是谁。<br>Click a speaker chip to jump to and highlight their lines behind this dialog.</p>
+    <div id="spk-inputs"><p style="color:#8b949e">本次会议还没有识别到说话人。No speakers detected yet.</p></div>
+    <p style="color:#8b949e;font-size:13px">输过的名字会记在本机浏览器,下次点输入框直接下拉选择。Typed names are remembered and offered for quick selection.</p>
+    <button id="export-go">下载 .md Download</button>
+  </div>
+</div>
+
+<script>
+const flowOrig = document.getElementById('flow-orig');
+const flowTrans = document.getElementById('flow-trans');
+const translations = document.getElementById('translations');
+const originals = document.getElementById('originals');
+const interim = document.getElementById('interim');
+const draft = document.getElementById('draft');
+const status = document.getElementById('status');
+let lastSpeaker = null;
+const history = [];        // committed: {id, lang, source, speaker}
+const transById = {};      // id -> translation
+
+function scrollToBottom(el) { el.scrollTop = el.scrollHeight; }
+
+function speakerNum(speaker) {
+  const n = parseInt(speaker, 10);
+  return isNaN(n) ? speaker : n + 1;
+}
+
+function speakerChip(speaker) {
+  const chip = document.createElement('span');
+  chip.className = 'sp sp' + ((parseInt(speaker, 10) || 0) % 4);
+  chip.textContent = '说话人 ' + speakerNum(speaker);
+  return chip;
+}
+
+function setDraft(text) {
+  draft.style.display = 'block';
+  draft.textContent = '';
+  const tag = document.createElement('span');
+  tag.className = 'draft-tag';
+  tag.textContent = '≈ 快速翻译 Quick draft';
+  draft.append(tag, document.createTextNode(text));
+  scrollToBottom(translations);
+}
+
+function clearDraft() {
+  draft.style.display = 'none';
+  draft.textContent = '';
+}
+
+const seenIds = new Set();   // committed ids already rendered (reconnect-safe)
+
+function addOriginal(ev) {
+  if (seenIds.has(ev.id)) return;  // history replay after a WS reconnect
+  seenIds.add(ev.id);
+  clearDraft();
+  history.push(ev);
+  const showChip = ev.speaker != null && ev.speaker !== lastSpeaker;
+  if (ev.speaker != null) lastSpeaker = ev.speaker;
+
+  const span = document.createElement('span');
+  span.className = 's';
+  if (ev.speaker != null) span.dataset.spk = ev.speaker;
+  if (showChip) span.appendChild(speakerChip(ev.speaker));
+  span.appendChild(document.createTextNode(ev.source + ' '));
+  flowOrig.appendChild(span);
+  interim.textContent = '';
+  scrollToBottom(originals);
+
+  const t = document.createElement('span');
+  t.className = 's pending';
+  t.dataset.id = ev.id;
+  if (showChip) t.appendChild(speakerChip(ev.speaker));
+  t.appendChild(document.createTextNode('… '));
+  flowTrans.appendChild(t);
+  scrollToBottom(translations);
+}
+
+function addTranslation(ev) {
+  transById[ev.id] = ev.text;
+  const t = flowTrans.querySelector(`[data-id="${ev.id}"]`);
+  if (!t) return;
+  t.classList.remove('pending');
+  t.lastChild.textContent = ev.text + ' ';
+  scrollToBottom(translations);
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const ws = new WebSocket(proto + location.host + location.pathname);
+  ws.onopen = () => { status.textContent = 'connected'; status.className = 'connected'; };
+  ws.onclose = () => { status.textContent = 'reconnecting…'; status.className = '';
+                      setTimeout(connect, 1500); };
+  ws.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    if (ev.type === 'interim') { interim.textContent = '… ' + ev.text; scrollToBottom(originals); }
+    else if (ev.type === 'draft') setDraft(ev.text);
+    else if (ev.type === 'committed') addOriginal(ev);
+    else if (ev.type === 'translation') addTranslation(ev);
+    else if (ev.type === 'share') onShare(ev);
+    else if (ev.type === 'status') {
+      status.textContent = ev.text;
+      status.className = ev.text === 'connected' ? 'connected' : '';
+    }
+  };
+}
+connect();
+
+// ---- modals ----
+for (const el of document.querySelectorAll('.close')) {
+  el.onclick = () => document.getElementById(el.dataset.close).classList.remove('open');
+}
+for (const mask of document.querySelectorAll('.modal-mask')) {
+  mask.onclick = (e) => { if (e.target === mask) mask.classList.remove('open'); };
+}
+document.getElementById('info-btn').onclick = () =>
+  document.getElementById('info-mask').classList.add('open');
+
+const langBtn = document.getElementById('lang-btn');
+const infoBox = document.getElementById('info-box');
+function setInfoLang(lang) {
+  infoBox.dataset.lang = lang;
+  langBtn.textContent = lang === 'en' ? '中文' : 'EN';
+  localStorage.setItem('babel_info_lang', lang);
+}
+setInfoLang(localStorage.getItem('babel_info_lang') === 'en' ? 'en' : 'zh');
+langBtn.onclick = () => setInfoLang(infoBox.dataset.lang === 'en' ? 'zh' : 'en');
+
+// ---- share ----
+let shareInfo = {};
+function onShare(ev) {
+  shareInfo = ev;
+  document.getElementById('share-btn').style.display = '';
+}
+document.getElementById('share-btn').onclick = () => {
+  const box = document.getElementById('share-links');
+  box.textContent = '';
+  for (const [key, label] of [['lan', '局域网 LAN'], ['public', '公网 Public']]) {
+    if (!shareInfo[key]) continue;
+    const row = document.createElement('div');
+    row.className = 'spk-row';
+    const input = document.createElement('input');
+    input.type = 'text'; input.readOnly = true; input.value = shareInfo[key];
+    input.onclick = () => input.select();
+    const btn = document.createElement('button');
+    btn.className = 'hbtn'; btn.textContent = '复制 Copy';
+    btn.onclick = () => { navigator.clipboard.writeText(shareInfo[key]); btn.textContent = '已复制 ✓'; };
+    const lab = document.createElement('div');
+    lab.style.margin = '8px 0 2px'; lab.textContent = label;
+    box.appendChild(lab); row.appendChild(input); row.appendChild(btn);
+    box.appendChild(row);
+  }
+  document.getElementById('share-mask').classList.add('open');
+};
+
+// ---- export ----
+// Name pool: every name ever typed is remembered and offered via datalist.
+// Names are NOT bound to speaker ids across meetings (speaker 1 is not
+// always Matt); within one page session, ids keep their names so repeated
+// exports of the same meeting stay consistent.
+const sessionNames = {};
+function namePool() {
+  try { return JSON.parse(localStorage.getItem('babel_spk_pool') || '[]'); }
+  catch { return []; }
+}
+
+document.getElementById('export-btn').onclick = () => {
+  const pool = namePool();
+  let datalist = document.getElementById('spk-pool');
+  if (!datalist) {
+    datalist = document.createElement('datalist');
+    datalist.id = 'spk-pool';
+    document.body.appendChild(datalist);
+  }
+  datalist.textContent = '';
+  for (const n of pool) {
+    const opt = document.createElement('option');  // no innerHTML: names are user input
+    opt.value = n;
+    datalist.appendChild(opt);
+  }
+  const ids = [...new Set(history.map(e => e.speaker).filter(s => s != null))]
+    .sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+  const box = document.getElementById('spk-inputs');
+  box.textContent = '';
+  if (!ids.length) {
+    box.innerHTML = '<p style="color:#8b949e">本次会议还没有识别到说话人。No speakers detected yet.</p>';
+  }
+  for (const id of ids) {
+    const row = document.createElement('div');
+    row.className = 'spk-row';
+    const chip = speakerChip(id);
+    chip.title = '点击定位 TA 的句子 Click to locate their lines';
+    chip.onclick = () => locateSpeaker(id);
+    row.appendChild(chip);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.setAttribute('list', 'spk-pool');
+    input.placeholder = 'Speaker ' + speakerNum(id) + ' 的名字 name (可留空 optional)';
+    input.value = sessionNames[id] || '';
+    input.dataset.spk = id;
+    row.appendChild(input);
+    box.appendChild(row);
+  }
+  document.getElementById('export-mask').classList.add('open');
+};
+
+function locateSpeaker(id) {
+  for (const el of flowOrig.querySelectorAll('.s.hl')) el.classList.remove('hl');
+  const spans = [...flowOrig.querySelectorAll(`.s[data-spk="${id}"]`)];
+  for (const el of spans) el.classList.add('hl');
+  if (spans.length) spans[0].scrollIntoView({behavior: 'smooth', block: 'center'});
+}
+
+document.getElementById('export-go').onclick = () => {
+  const pool = namePool();
+  for (const input of document.querySelectorAll('#spk-inputs input')) {
+    const name = input.value.trim();
+    if (!name) continue;
+    sessionNames[input.dataset.spk] = name;
+    if (!pool.includes(name)) pool.push(name);
+  }
+  localStorage.setItem('babel_spk_pool', JSON.stringify(pool));
+  const kind = document.querySelector('input[name="exp-kind"]:checked').value;
+  const nameOf = (id) => id == null ? '' : (sessionNames[id] || 'Speaker ' + speakerNum(id));
+
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const kindZh = {original: '原文', translation: '译文', bilingual: '双语对照'}[kind];
+  let md = `# Babel 会议字幕 ${stamp}\n\n导出类型:${kindZh} · CKBA Babel\n\n`;
+  for (const ev of history) {
+    const who = nameOf(ev.speaker);
+    const tag = who ? `**${who}**: ` : '';
+    if (kind !== 'translation') md += `${tag}${ev.source}\n\n`;
+    if (kind !== 'original') {
+      const tr = transById[ev.id];
+      md += kind === 'bilingual' ? `> ${tr || '(待翻译 pending)'}\n\n` : `${tag}${tr || '(待翻译 pending)'}\n\n`;
+    }
+  }
+  const blob = new Blob([md], {type: 'text/markdown;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `babel-${stamp}-${kind}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  document.getElementById('export-mask').classList.remove('open');
+};
+</script>
+</body>
+</html>

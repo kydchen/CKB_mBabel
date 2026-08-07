@@ -1,0 +1,5 @@
+websockets>=14
+openai>=1.40
+sounddevice>=0.4.6
+httpx>=0.27
+volcengine-python-sdk[ark]>=5.0

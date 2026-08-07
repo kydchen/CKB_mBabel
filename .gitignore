@@ -1,0 +1,6 @@
+.env
+solution/transcripts/
+solution/.venv/
+solution/__pycache__/
+*.log
+.DS_Store

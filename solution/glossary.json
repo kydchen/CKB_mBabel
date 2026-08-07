@@ -1,0 +1,33 @@
+{
+  "domains": "Blockchain technology meetings of the Nervos CKB ecosystem: UTXO model, layer-2 networks, smart contracts, token economics.",
+  "corrections": {
+    "MATE": "Matt",
+    "CKC": "CKCon",
+    "RGB 加加": "RGB++",
+    "RGB加加": "RGB++"
+  },
+  "terms": [
+    { "source": "UTXO", "target": "UTXO" },
+    { "source": "CKB", "target": "CKB" },
+    { "source": "Nervos", "target": "Nervos" },
+    { "source": "Cell模型", "target": "Cell model" },
+    { "source": "Cell", "target": "Cell" },
+    { "source": "RGB++", "target": "RGB++" },
+    { "source": "Fiber网络", "target": "Fiber Network" },
+    { "source": "Fiber", "target": "Fiber Network" },
+    { "source": "光纤网络", "target": "Fiber Network" },
+    { "source": "闪电网络", "target": "Lightning Network" },
+    { "source": "Lightning Network", "target": "闪电网络" },
+    { "source": "同构绑定", "target": "isomorphic binding" },
+    { "source": "状态通道", "target": "state channel" },
+    { "source": "支付通道", "target": "payment channel" },
+    { "source": "主网", "target": "mainnet" },
+    { "source": "测试网", "target": "testnet" },
+    { "source": "代币", "target": "token" },
+    { "source": "稳定币", "target": "stablecoin" },
+    { "source": "Gas费", "target": "gas fee" },
+    { "source": "锁仓", "target": "token lock-up" },
+    { "source": "DAO", "target": "DAO" },
+    { "source": "CKB-VM", "target": "CKB-VM" }
+  ]
+}
