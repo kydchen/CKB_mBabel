@@ -13,15 +13,14 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 ## Features
 
 - **Both directions, one stream**: Chinese speech gets English captions, English speech gets Chinese captions, language detection and code-switching handled per sentence.
-- **Draft + refined translation**: a rough draft translation (≈ Quick draft) follows the sentence as it is spoken; the refined translation lands ~0.5s after the sentence commits.
-- **Speaker labels**: server-side speaker clustering; a colored chip marks each turn change.
+- **Three-stage translation, no waiting**: a rough draft (≈ Quick draft) follows the sentence as it is spoken; the moment the sentence ends the draft is promoted as the provisional caption, then a context-aware refined pass (previous sentences as context — pronouns and ellipsis-heavy Chinese resolved) silently replaces it. You never see a "translating…" placeholder.
+- **Speaker labels**: server-side speaker clustering; names sit in the script margin, and the names you assign at export time update the page live.
 - **Domain adaptation without training**: ASR hotwords (direct + boosting table), a client-side corrections map for systematic mishearings, and a translation glossary enforced per sentence.
 - **Live corrections (host only)**: fix a recurring mishearing mid-meeting from the Lab panel (`错词=正确词`); applies to all following sentences instantly and persists to the glossary on exit.
-- **Context polish (experimental)**: an optional slower LLM pass re-translates each sentence with the previous sentences as context and updates the line in place when it disagrees — helps pronouns and ellipsis-heavy Chinese.
 - **Viewer preferences**: per-browser language view (bilingual / Chinese only / English only), four font sizes including a full-screen presentation mode; captions auto-follow only while you are at the bottom, with a "back to latest" button after scrolling up.
 - **Shareable, read-only for viewers**: LAN link out of the box; a public `trycloudflare.com` link is one flag away (no account needed). Pipeline controls require a host token that is never sent to LAN or tunneled viewers.
 - **Export**: Markdown or timestamped SRT — original, translation, or bilingual — with speaker names you type once and the browser remembers.
-- **Robust for long meetings**: ASR auto-reconnects with backoff after network blips, translations retry and mark failures visibly, and the full transcript auto-saves to disk (JSONL + Markdown) regardless of the browser.
+- **Robust for long meetings**: ASR auto-reconnects with backoff, rate limits are classified and backed off (failed lines quietly backfill), language-misidentified sentences get a "mishearing?" marker, and the full transcript auto-saves to disk (JSONL + Markdown) regardless of the browser.
 
 ## Architecture
 
@@ -29,11 +28,13 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 mic / system audio (BlackHole + Aggregate Device on macOS)
   → Volcengine Seed-ASR 2.0 (streaming, two-pass, hotwords, speaker info)
   → sentence accumulator (language-boundary split, silence watchdog)
-  → Volcengine machine-translation LLM (matx_translate, glossary_list)
+  → live draft: Volcengine MT (matx_translate, native glossary_list)
+  → at commit: draft promoted to the caption, then replaced by a
+    context-aware refined pass (Doubao Seed mini on Ark)
   → local web UI (one port: HTTP page + WebSocket events)
 ```
 
-One Volcengine speech-console API key covers both ASR and translation. Total latency: interim text <1s, refined translation ~0.5s after a sentence closes.
+One Volcengine speech-console API key covers ASR and the live drafts; an optional Ark key enables the context-aware refined pass (recommended). Total latency: interim text <1s, a readable caption the instant a sentence closes, refined replacement a couple of seconds later — invisibly.
 
 ## Cost
 
@@ -54,7 +55,7 @@ Babel is ~12x cheaper than iFlytek's LLM-tier simultaneous interpretation while 
 1. Open the speech console: `console.volcengine.com/speech`.
 2. Activate **豆包流式语音识别模型 2.0** (hourly billing, resource `volc.seedasr.sauc.duration`) and **机器翻译大模型** (resource `volc.speech.mt`).
 3. Create an API key in the speech console (API Key 管理).
-4. Copy `.env.example` to `.env` and fill in `VOLC_ASR_API_KEY`.
+4. Copy `.env.example` to `.env` and fill in `VOLC_ASR_API_KEY`. Optionally add `ARK_API_KEY` (console.volcengine.com/ark) to enable the context-aware refined pass — without it, refined falls back to the same MT as the drafts.
 
 Optional: for hotwords beyond the 100-token direct cap, upload `hotwords/boosting_table.txt` in 自学习平台 → 热词管理 and set `VOLC_BOOSTING_TABLE_ID` in `.env`.
 
