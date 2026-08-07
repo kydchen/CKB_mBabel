@@ -14,8 +14,12 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 - **Draft + refined translation**: a rough draft translation (≈ Quick draft) follows the sentence as it is spoken; the refined translation lands ~0.5s after the sentence commits.
 - **Speaker labels**: server-side speaker clustering; a colored chip marks each turn change.
 - **Domain adaptation without training**: ASR hotwords (direct + boosting table), a client-side corrections map for systematic mishearings, and a translation glossary enforced per sentence.
-- **Shareable**: viewers on the same network open a LAN link; a public link via cloudflared quick tunnel is one flag away (no account needed).
-- **Export**: download the meeting as Markdown — original, translation, or bilingual — with speaker names you type once and the browser remembers.
+- **Live corrections (host only)**: fix a recurring mishearing mid-meeting from the Lab panel (`错词=正确词`); applies to all following sentences instantly and persists to the glossary on exit.
+- **Context polish (experimental)**: an optional slower LLM pass re-translates each sentence with the previous sentences as context and updates the line in place when it disagrees — helps pronouns and ellipsis-heavy Chinese.
+- **Viewer preferences**: per-browser language view (bilingual / Chinese only / English only), four font sizes including a full-screen presentation mode; captions auto-follow only while you are at the bottom, with a "back to latest" button after scrolling up.
+- **Shareable, read-only for viewers**: LAN link out of the box; a public `trycloudflare.com` link is one flag away (no account needed). Pipeline controls require a host token that is never sent to LAN or tunneled viewers.
+- **Export**: Markdown or timestamped SRT — original, translation, or bilingual — with speaker names you type once and the browser remembers.
+- **Robust for long meetings**: ASR auto-reconnects with backoff after network blips, translations retry and mark failures visibly, and the full transcript auto-saves to disk (JSONL + Markdown) regardless of the browser.
 
 ## Architecture
 
@@ -80,9 +84,10 @@ cd solution
 
 A browser window opens with the caption page. Useful flags:
 
-- `--share` — print a LAN link, and a public `trycloudflare.com` link if `cloudflared` is installed (`brew install cloudflared`).
+- `--share` — print a LAN link, and a public `trycloudflare.com` link if `cloudflared` is installed (`brew install cloudflared`); the page is served under a random token path.
 - `--translator {volc-mt,ark,qwen-mt}` — translation backend; default `volc-mt`.
 - `--end-window 600` — ms of silence that closes an ASR fragment.
+- `--port 8899` — caption UI port (default 8765), for running two instances side by side.
 - `--wav test.wav` — replay a 16kHz mono WAV instead of the mic (a sample is included).
 - `--no-ui` — terminal-only output.
 
@@ -105,10 +110,13 @@ Babel.command macOS double-click launcher
 .env.example  credentials template
 ```
 
+Transcripts land in `solution/transcripts/` (created at runtime, gitignored).
+
 ## Notes and limits
 
 - Speaker labels are cluster ids (说话人 1/2/…), stable within a session, not named identities.
 - Cloud processing means meeting audio leaves the machine; for fully offline needs this stack is not the answer.
+- No pause button yet: the ASR server closes idle sessions after ~8s, so a real pause needs coordinated sender/reconnect logic (planned).
 - Tested on macOS (Apple Silicon). The audio-capture layer is cross-platform in principle; the routing instructions are macOS-specific.
 
 ## License

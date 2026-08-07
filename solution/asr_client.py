@@ -153,6 +153,16 @@ def _parse_response(frame: bytes) -> tuple[int, int, bytes]:
 class VolcAsrClient:
     def __init__(self, config: AsrConfig):
         self.config = config
+        self._ws = None  # live connection, kept so close() can force a restart
+
+    async def close(self) -> None:
+        """Drop the current connection; the caller's reconnect loop then
+        restarts the session with whatever config changed (e.g. enable_ddc)."""
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
 
     async def transcribe(
         self, audio_chunks: AsyncIterator[bytes]
@@ -176,6 +186,7 @@ class VolcAsrClient:
         )
 
         async with ws_ctx as ws:
+            self._ws = ws
             logid = ws.response.headers.get("X-Tt-Logid", "") if ws.response else ""
             if logid:
                 print(f"[asr] connected, logid={logid}")
@@ -206,3 +217,4 @@ class VolcAsrClient:
                         break
             finally:
                 sender.cancel()
+                self._ws = None

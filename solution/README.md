@@ -102,3 +102,13 @@ Double-click `../Babel.command` in Finder (right-click → Open the first time).
 - Draft translations use a fixed 0.5s debounce and a reduced identity-terms-only glossary (proper nouns), keeping draft cost far below the refined pass without visible lag.
 - `--device` accepts a device name substring (e.g. `--device Aggregate`), immune to index drift.
 - Known limit: no pause button — the ASR server closes sessions after 8s idle, so a real pause needs coordinated sender/reconnect logic (planned).
+
+
+## Experiments and UX (2026-08-07 evening)
+
+- Header controls: language view (bilingual / zh-only / English-only, per viewer), font size presets (S/M/L/投影 XL with header hidden), both persisted per browser.
+- Scroll-follow: auto-scroll only while you are at the bottom; a "back to latest" button appears when you read back.
+- Lab modal (实验 Lab): disfluency smoothing (DDC) live toggle — restarts the ASR session via the reconnect loop (~2s gap); context polish toggle — an ark model re-translates each committed sentence with the previous two originals as context and updates the line in place if it disagrees (default off; the fast refined pass is untouched).
+- Live correction (会中纠错): `wrong=right` in the Lab modal takes effect immediately and is persisted to `glossary.json` corrections on exit. Localhost-only; remote viewers cannot steer the pipeline.
+- Timestamps: every committed line carries a session-relative `ts` into the UI and the transcript; export offers SRT (.srt) alongside Markdown.
+- Silence flush lowered from 3.0s to 2.0s. On ASR reconnect the audio queue is drained — a few seconds of audio are sacrificed so the new session never re-recognizes already-committed speech.

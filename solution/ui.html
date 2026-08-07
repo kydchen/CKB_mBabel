@@ -94,6 +94,36 @@
   .modal .spk-row .sp { flex: none; cursor: pointer; }
   .modal .spk-row input { flex: 1; }
   .s.hl { background: #3b2f00; outline: 1px solid #ffa657; border-radius: 4px; }
+  /* scroll-follow: pause auto-scroll when the user reads back */
+  .follow-btn {
+    position: sticky; float: right; bottom: 10px; margin-right: 10px;
+    font-size: 13px; color: #e6edf3; background: #1f6feb; border: none;
+    border-radius: 14px; padding: 4px 12px; cursor: pointer; display: none;
+  }
+  /* viewer language filter */
+  body.view-en #flow-orig .s:not([data-lang="en"]) { display: none; }
+  body.view-en #flow-trans .s:not([data-lang="zh"]) { display: none; }
+  body.view-zh #flow-orig .s:not([data-lang="zh"]) { display: none; }
+  body.view-zh #flow-trans .s:not([data-lang="en"]) { display: none; }
+  /* font-size presets */
+  body.fs-s .flow, body.fs-s #interim { font-size: 16px; }
+  body.fs-s #draft { font-size: 16px; }
+  body.fs-l .flow, body.fs-l #interim { font-size: 26px; }
+  body.fs-l #draft { font-size: 24px; }
+  body.fs-xl .flow, body.fs-xl #interim { font-size: 34px; line-height: 1.6; }
+  body.fs-xl #draft { font-size: 30px; }
+  body.fs-xl header { display: none; }
+  #pres-exit {
+    position: fixed; top: 10px; right: 12px; z-index: 20;
+    font-size: 14px; color: #e6edf3; background: #30363d;
+    border: 1px solid #484f58; border-radius: 8px; padding: 6px 14px;
+    cursor: pointer; display: none; opacity: .85;
+  }
+  body.fs-xl #pres-exit { display: block; }
+  select.hbtn { appearance: none; }
+  .lab-row { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+  .lab-row input[type=checkbox] { width: 18px; height: 18px; }
+  #corr-input { flex: 1; }
   #export-go {
     margin-top: 14px; width: 100%; padding: 8px; font-size: 15px; font-weight: 600;
     background: #238636; color: #fff; border: none; border-radius: 8px; cursor: pointer;
@@ -102,9 +132,22 @@
 </style>
 </head>
 <body>
+<button id="pres-exit" title="退出投屏 Exit presentation">✕ 退出投屏 Exit</button>
 <header>
   <span><b> CKB mBabel</b> 双语字幕</span>
   <span class="hbtns">
+    <select class="hbtn" id="view-sel" title="语言视图 Language view">
+      <option value="both">双语 Both</option>
+      <option value="zh">中文 zh</option>
+      <option value="en">English</option>
+    </select>
+    <select class="hbtn" id="fs-sel" title="字号 Font size">
+      <option value="s">小 S</option>
+      <option value="m" selected>中 M</option>
+      <option value="l">大 L</option>
+      <option value="xl">投屏 XL</option>
+    </select>
+    <button class="hbtn" id="lab-btn">实验 Lab</button>
     <button class="hbtn" id="share-btn" style="display:none">分享 Share</button>
     <button class="hbtn" id="info-btn">说明 About</button>
     <button class="hbtn" id="export-btn">导出 Export</button>
@@ -157,6 +200,30 @@
   </div>
 </div>
 
+<div class="modal-mask" id="lab-mask">
+  <div class="modal">
+    <span class="close" data-close="lab-mask">✕</span>
+    <h2>实验功能 Experimental</h2>
+    <div class="lab-row">
+      <input type="checkbox" id="ddc-toggle">
+      <label for="ddc-toggle" style="margin:0">口语顺滑 DDC(去嗯啊结巴,会重启识别连接约 2 秒)<br>
+      <span class="en">Disfluency smoothing. Restarts the ASR session (~2s gap).</span></label>
+    </div>
+    <div class="lab-row">
+      <input type="checkbox" id="polish-toggle">
+      <label for="polish-toggle" style="margin:0">上下文润色(精翻后再带前文润色,慢但无感,可能修指代)<br>
+      <span class="en">Context polish: a slower ark pass re-translates with previous sentences as context and updates the line if it disagrees.</span></label>
+    </div>
+    <h3>会中纠错 Live correction</h3>
+    <div class="lab-row">
+      <input type="text" id="corr-input" placeholder="错词=正确词 wrong=right">
+      <button class="hbtn" id="corr-go">提交 Add</button>
+    </div>
+    <p id="lab-note" style="color:#ffa657;font-size:13px">实验控制仅主持人本机可用。Lab controls are only available on the host machine.</p>
+    <p style="color:#8b949e;font-size:13px">即时生效,退出时写回 glossary.json,下次开会自动带着。Takes effect immediately and persists to glossary.json on exit. 仅本机可提交 Localhost only.</p>
+  </div>
+</div>
+
 <div class="modal-mask" id="export-mask">
   <div class="modal">
     <span class="close" data-close="export-mask">✕</span>
@@ -164,6 +231,9 @@
     <label><input type="radio" name="exp-kind" value="original"> 原文 Original only</label>
     <label><input type="radio" name="exp-kind" value="translation"> 译文 Translation only</label>
     <label><input type="radio" name="exp-kind" value="bilingual" checked> 双语对照 Original + Translation</label>
+    <h3>格式 Format</h3>
+    <label><input type="radio" name="exp-fmt" value="md" checked> Markdown .md</label>
+    <label><input type="radio" name="exp-fmt" value="srt"> 字幕文件 SRT .srt</label>
     <h3>说话人命名 Speaker names</h3>
     <p style="color:#8b949e;font-size:13px">点说话人标签,主屏会跳到并高亮 TA 说过的句子,方便确认是谁。<br>Click a speaker chip to jump to and highlight their lines behind this dialog.</p>
     <div id="spk-inputs"><p style="color:#8b949e">本次会议还没有识别到说话人。No speakers detected yet.</p></div>
@@ -184,19 +254,111 @@ let lastSpeaker = null;
 const history = [];        // committed: {id, lang, source, speaker}
 const transById = {};      // id -> translation
 
-function scrollToBottom(el) { el.scrollTop = el.scrollHeight; }
+function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 80; }
+
+// scroll-follow: auto-scroll only while the user is at the bottom; a "back
+// to latest" button appears when they read back (chat-app behavior)
+const pinned = { originals: true, translations: true };
+const followBtns = {};
+for (const key of ['originals', 'translations']) {
+  const pane = document.getElementById(key);
+  const btn = document.createElement('button');
+  btn.className = 'follow-btn';
+  btn.textContent = '↓ 回到最新 latest';
+  btn.onclick = () => { pane.scrollTop = pane.scrollHeight; };
+  pane.appendChild(btn);
+  followBtns[key] = btn;
+  pane.addEventListener('scroll', () => {
+    pinned[key] = nearBottom(pane);
+    btn.style.display = pinned[key] ? 'none' : 'block';
+  });
+}
+
+function scrollToBottom(el) {
+  const key = el.id;
+  if (pinned[key] !== false) el.scrollTop = el.scrollHeight;
+  else followBtns[key].style.display = 'block';
+}
 
 function speakerNum(speaker) {
   const n = parseInt(speaker, 10);
   return isNaN(n) ? speaker : n + 1;
 }
 
+function chipText(n) {
+  return 'Speaker ' + n;  // single label for everyone; 中文同事也看得懂
+}
+
 function speakerChip(speaker) {
   const chip = document.createElement('span');
   chip.className = 'sp sp' + ((parseInt(speaker, 10) || 0) % 4);
-  chip.textContent = '说话人 ' + speakerNum(speaker);
+  chip.dataset.spknum = speakerNum(speaker);
+  chip.textContent = chipText(chip.dataset.spknum);
   return chip;
 }
+
+function refreshChips() {
+  for (const c of document.querySelectorAll('.sp')) {
+    if (c.dataset.spknum) c.textContent = chipText(c.dataset.spknum);
+  }
+}
+
+// viewer preferences: language view + font size, persisted per browser
+const viewSel = document.getElementById('view-sel');
+const fsSel = document.getElementById('fs-sel');
+function applyPrefs() {
+  const v = viewSel.value, f = fsSel.value;
+  document.body.className = document.body.className.replace(/\s*(view|fs)-\w+/g, '');
+  if (v !== 'both') document.body.classList.add('view-' + v);
+  if (f !== 'm') document.body.classList.add('fs-' + f);
+  refreshChips();
+  localStorage.setItem('babel_prefs', JSON.stringify({view: v, fs: f}));
+}
+viewSel.onchange = applyPrefs;
+fsSel.onchange = applyPrefs;
+document.getElementById('pres-exit').onclick = () => {
+  fsSel.value = 'm';
+  applyPrefs();
+};
+try {
+  const p = JSON.parse(localStorage.getItem('babel_prefs') || '{}');
+  if (p.view) viewSel.value = p.view;
+  if (p.fs) fsSel.value = p.fs;
+} catch {}
+applyPrefs();
+
+// control channel to the server (corrections, experiment toggles).
+// The token arrives only on direct loopback connections; tunneled/LAN
+// viewers never get it, and the Lab controls stay disabled for them.
+let wsConn = null;
+let controlToken = null;
+function wsSend(obj) {
+  if (wsConn && wsConn.readyState === 1 && controlToken) {
+    wsConn.send(JSON.stringify({...obj, token: controlToken}));
+  }
+}
+function setLabEnabled(on) {
+  for (const el of document.querySelectorAll('#lab-mask input, #lab-mask .hbtn')) {
+    el.disabled = !on;
+  }
+  document.getElementById('lab-note').style.display = on ? 'none' : '';
+}
+document.getElementById('lab-btn').onclick = () => {
+  setLabEnabled(!!controlToken);
+  document.getElementById('lab-mask').classList.add('open');
+};
+document.getElementById('ddc-toggle').onchange = (e) =>
+  wsSend({type: 'ddc', enabled: e.target.checked});
+document.getElementById('polish-toggle').onchange = (e) =>
+  wsSend({type: 'polish', enabled: e.target.checked});
+document.getElementById('corr-go').onclick = () => {
+  const box = document.getElementById('corr-input');
+  const i = box.value.indexOf('=');
+  if (i <= 0) return;
+  wsSend({type: 'correction',
+          wrong: box.value.slice(0, i).trim(), right: box.value.slice(i + 1).trim()});
+  box.value = '';
+};
 
 function setDraft(text) {
   draft.style.display = 'block';
@@ -225,6 +387,7 @@ function addOriginal(ev) {
 
   const span = document.createElement('span');
   span.className = 's';
+  span.dataset.lang = ev.lang;
   if (ev.speaker != null) span.dataset.spk = ev.speaker;
   if (showChip) span.appendChild(speakerChip(ev.speaker));
   span.appendChild(document.createTextNode(ev.source + ' '));
@@ -235,6 +398,7 @@ function addOriginal(ev) {
   const t = document.createElement('span');
   t.className = 's pending';
   t.dataset.id = ev.id;
+  t.dataset.lang = ev.lang;
   if (showChip) t.appendChild(speakerChip(ev.speaker));
   t.appendChild(document.createTextNode('… '));
   flowTrans.appendChild(t);
@@ -253,6 +417,7 @@ function addTranslation(ev) {
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
   const ws = new WebSocket(proto + location.host + location.pathname);
+  wsConn = ws;
   ws.onopen = () => { status.textContent = 'connected'; status.className = 'connected'; };
   ws.onclose = () => { status.textContent = 'reconnecting…'; status.className = '';
                       setTimeout(connect, 1500); };
@@ -263,6 +428,7 @@ function connect() {
     else if (ev.type === 'committed') addOriginal(ev);
     else if (ev.type === 'translation') addTranslation(ev);
     else if (ev.type === 'share') onShare(ev);
+    else if (ev.type === 'control_token') { controlToken = ev.token; }
     else if (ev.type === 'status') {
       status.textContent = ev.text;
       status.className = ev.text === 'connected' ? 'connected' : '';
@@ -329,6 +495,14 @@ function namePool() {
   catch { return []; }
 }
 
+// export button label follows the chosen format
+for (const r of document.querySelectorAll('input[name="exp-fmt"]')) {
+  r.onchange = () => {
+    document.getElementById('export-go').textContent =
+      '下载 .' + document.querySelector('input[name="exp-fmt"]:checked').value + ' Download';
+  };
+}
+
 document.getElementById('export-btn').onclick = () => {
   const pool = namePool();
   let datalist = document.getElementById('spk-pool');
@@ -386,26 +560,50 @@ document.getElementById('export-go').onclick = () => {
   }
   localStorage.setItem('babel_spk_pool', JSON.stringify(pool));
   const kind = document.querySelector('input[name="exp-kind"]:checked').value;
+  const fmt = document.querySelector('input[name="exp-fmt"]:checked').value;
   const nameOf = (id) => id == null ? '' : (sessionNames[id] || 'Speaker ' + speakerNum(id));
 
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
-  const kindZh = {original: '原文', translation: '译文', bilingual: '双语对照'}[kind];
-  let md = `# Babel 会议字幕 ${stamp}\n\n导出类型:${kindZh} · CKBA Babel\n\n`;
-  for (const ev of history) {
-    const who = nameOf(ev.speaker);
-    const tag = who ? `**${who}**: ` : '';
-    if (kind !== 'translation') md += `${tag}${ev.source}\n\n`;
-    if (kind !== 'original') {
-      const tr = transById[ev.id];
-      md += kind === 'bilingual' ? `> ${tr || '(待翻译 pending)'}\n\n` : `${tag}${tr || '(待翻译 pending)'}\n\n`;
+  let md, mime;
+  if (fmt === 'srt') {
+    const srtTime = (sec) => {
+      const ms = Math.round((sec % 1) * 1000);
+      const p3 = String(ms).padStart(3, '0');
+      const s = Math.floor(sec) % 60, m = Math.floor(sec / 60) % 60, h = Math.floor(sec / 3600);
+      return `${pad(h)}:${pad(m)}:${pad(s)},${p3}`;
+    };
+    md = '';
+    history.forEach((ev, i) => {
+      const start = ev.ts || 0;
+      const next = history[i + 1];
+      const end = next && next.ts ? Math.max(next.ts, start + 0.5) : start + 5;
+      const who = nameOf(ev.speaker);
+      const lines = [];
+      if (kind !== 'translation') lines.push((who ? who + ': ' : '') + ev.source);
+      if (kind !== 'original') lines.push(transById[ev.id] || '(pending)');
+      md += `${i + 1}\n${srtTime(start)} --> ${srtTime(end)}\n${lines.join('\n')}\n\n`;
+    });
+    mime = 'application/x-subrip';
+  } else {
+    const kindZh = {original: '原文', translation: '译文', bilingual: '双语对照'}[kind];
+    md = `# Babel 会议字幕 ${stamp}\n\n导出类型:${kindZh} · CKBA Babel\n\n`;
+    for (const ev of history) {
+      const who = nameOf(ev.speaker);
+      const tag = who ? `**${who}**: ` : '';
+      if (kind !== 'translation') md += `${tag}${ev.source}\n\n`;
+      if (kind !== 'original') {
+        const tr = transById[ev.id];
+        md += kind === 'bilingual' ? `> ${tr || '(待翻译 pending)'}\n\n` : `${tag}${tr || '(待翻译 pending)'}\n\n`;
+      }
     }
+    mime = 'text/markdown;charset=utf-8';
   }
-  const blob = new Blob([md], {type: 'text/markdown;charset=utf-8'});
+  const blob = new Blob([md], {type: mime});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `babel-${stamp}-${kind}.md`;
+  a.download = `babel-${stamp}-${kind}.${fmt}`;
   a.click();
   URL.revokeObjectURL(a.href);
   document.getElementById('export-mask').classList.remove('open');

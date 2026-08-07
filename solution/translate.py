@@ -156,12 +156,22 @@ class ArkTranslator:
         )
 
     async def translate(self, text: str, source_lang: str, target_lang: str,
-                        lite: bool = False) -> str:
+                        lite: bool = False,
+                        context: list[str] | None = None) -> str:
+        if context:
+            ctx = "\n".join(f"- {c}" for c in context)
+            user = (
+                f"Recent meeting context for reference only, do NOT translate it:\n"
+                f"{ctx}\n\n"
+                f"Now translate this sentence into {target_lang}, output ONLY the translation:\n{text}"
+            )
+        else:
+            user = f"[{target_lang}] {text}"
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": f"[{target_lang}] {text}"},
+                {"role": "user", "content": user},
             ],
             temperature=0.1,
             max_tokens=512,

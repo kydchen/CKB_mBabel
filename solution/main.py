@@ -23,7 +23,7 @@ import webbrowser
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from asr_client import AsrConfig, AsrError, VolcAsrClient
-from translate import Glossary, build_translator
+from translate import ArkTranslator, Glossary, build_translator
 from ui_server import CaptionUI
 
 
@@ -322,10 +322,14 @@ async def run(args) -> None:
               f"and set VOLC_BOOSTING_TABLE_ID to activate zh hotwords")
 
     # ASR correction map: fix systematic mishearings (e.g. MATE -> Matt,
-    # CKC -> CKCon) client-side before display and translation.
-    corr_re = None
+    # CKC -> CKCon) client-side before display and translation. Rebuildable
+    # at runtime: the UI can push new corrections mid-meeting.
     corr_map = {k.lower(): v for k, v in glossary.corrections.items()}
-    if corr_map:
+    new_corrections: dict = {}  # pushed via UI this session, persisted on exit
+
+    def build_corr_re():
+        if not corr_map:
+            return None
         patterns = []
         for wrong in sorted(corr_map, key=len, reverse=True):
             pat = re.escape(wrong)
@@ -334,12 +338,14 @@ async def run(args) -> None:
                 # so bound by non-alphanumeric lookarounds instead
                 pat = rf"(?<![A-Za-z0-9]){pat}(?![A-Za-z0-9])"
             patterns.append(pat)
-        corr_re = re.compile("|".join(patterns), re.IGNORECASE)
+        return re.compile("|".join(patterns), re.IGNORECASE)
+
+    corr = {"re": build_corr_re()}
 
     def correct(text: str) -> str:
-        if not corr_re:
+        if not corr["re"]:
             return text
-        return corr_re.sub(lambda m: corr_map[m.group(0).lower()], text)
+        return corr["re"].sub(lambda m: corr_map[m.group(0).lower()], text)
 
     if args.translator == "volc-mt" and not os.environ.get("VOLC_ASR_API_KEY"):
         sys.exit(
@@ -362,6 +368,8 @@ async def run(args) -> None:
             await ui.start()
             url = f"http://127.0.0.1:{ui.port}{suffix}"
             print(f"[ui] captions at {url}")
+            print(f"[control] Lab token: {ui.control_token} "
+                  f"(the local page receives it automatically; never shared)")
             if args.share:
                 lan_url = f"http://{lan_ip()}:{ui.port}{suffix}"
                 print(f"[share] LAN link: {lan_url}")
@@ -407,6 +415,49 @@ async def run(args) -> None:
         )
     )
 
+    # Context polish (experimental, UI toggle): after the fast refined pass,
+    # an ark model re-translates with the previous sentences as context and
+    # updates the line in place when it disagrees. Built lazily-safe.
+    polish_state = {"enabled": False}
+    ark_polisher = None
+    try:
+        ark_polisher = ArkTranslator(
+            glossary, model=os.environ.get("ARK_MODEL", "doubao-seed-2-0-lite-260215")
+        )
+    except Exception:
+        print("[polish] ark backend unavailable; the polish toggle will no-op")
+
+    async def on_control(msg: dict) -> None:
+        """Control messages from the UI (localhost-guarded in ui_server)."""
+        kind = msg.get("type")
+        if kind == "correction":
+            wrong = (msg.get("wrong") or "").strip()
+            right = (msg.get("right") or "").strip()
+            if wrong and right and wrong.lower() != right.lower():
+                corr_map[wrong.lower()] = right
+                new_corrections[wrong] = right
+                corr["re"] = build_corr_re()
+                print(f"[corrections] {wrong} -> {right}")
+                if ui:
+                    await ui.emit({"type": "status", "text": f"correction: {wrong} → {right}"})
+        elif kind == "ddc":
+            enabled = bool(msg.get("enabled"))
+            if asr.config.enable_ddc != enabled:
+                asr.config.enable_ddc = enabled
+                print(f"[asr] enable_ddc={enabled}; restarting session")
+                if ui:
+                    await ui.emit({"type": "status",
+                                   "text": f"ddc {'on' if enabled else 'off'}, ASR restarting…"})
+                await asr.close()
+        elif kind == "polish":
+            polish_state["enabled"] = bool(msg.get("enabled"))
+            if ui:
+                await ui.emit({"type": "status",
+                               "text": f"context polish {'on' if polish_state['enabled'] else 'off'}"})
+
+    if ui:
+        ui.on_control = on_control
+
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     device = args.device
     if isinstance(device, str):
@@ -422,8 +473,11 @@ async def run(args) -> None:
 
     committed: set[tuple[int, int]] = set()
     translate_tasks: list[asyncio.Task] = []
+    polish_tasks: list[asyncio.Task] = []
     draft_tasks: list[asyncio.Task] = []  # cancelled on flush: finals have priority
     cache: dict[str, str] = {}
+    recent_sources: list[str] = []  # last committed originals, context for polish
+    session_t0 = time.time()
     seg_seq = 0
     draft_seq = 0
     last_draft = {"text": "", "time": 0.0}
@@ -437,7 +491,7 @@ async def run(args) -> None:
     FINAL_PUNCT = ("。", "！", "？", ".", "!", "?", "…")
     FILLER_RE = re.compile(r"^[嗯哦呃啊唉哼哈唔呐吧嘛呀哎\s,.，。！？!?…~～]+$")
     MAX_LINE_CHARS = 200
-    FLUSH_SILENCE_S = 3.0  # flush the live line after this much ASR quiet time
+    FLUSH_SILENCE_S = 2.0  # flush the live line after this much ASR quiet time
     last_activity = {"t": 0.0}
 
     async def draft_translate(text: str, seq: int) -> None:
@@ -457,9 +511,10 @@ async def run(args) -> None:
     async def commit(text: str, seg_id: int, speaker: str | None) -> None:
         src, tgt = detect_direction(text)
         arrow = "中→英" if src == "zh" else "EN→中"
+        ts = round(time.time() - session_t0, 1)
         if ui:
             await ui.emit({"type": "committed", "id": seg_id, "lang": src,
-                           "source": text, "speaker": speaker})
+                           "source": text, "speaker": speaker, "ts": ts})
         if text in cache:
             translated = cache[text]
         else:
@@ -478,13 +533,41 @@ async def run(args) -> None:
         if ui:
             await ui.emit({"type": "translation", "id": seg_id, "text": translated})
         record = {"seq": seg_id, "speaker": speaker, "lang": src,
-                  "source": text, "translation": translated}
+                  "source": text, "translation": translated,
+                  "ts": ts, "time": time.strftime("%H:%M:%S")}
         transcript_records.append(record)
         await asyncio.to_thread(_append_jsonl, jsonl_path, record)
+        ctx = recent_sources[-2:]
+        recent_sources.append(text)
+        if polish_state["enabled"] and ark_polisher is not None:
+            polish_tasks.append(
+                asyncio.create_task(polish(text, seg_id, src, tgt, ctx, translated))
+            )
         sys.stdout.write(
             f"{CLEAR_LINE}{DIM}[{arrow}] {text}{RESET}\n{BOLD}{translated}{RESET}\n"
         )
         sys.stdout.flush()
+
+    async def polish(text: str, seg_id: int, src: str, tgt: str,
+                     ctx: list[str], fast: str) -> None:
+        """Optional fourth pass: ark model with previous sentences as context.
+        Runs after the fast refined pass; updates the line only when it
+        disagrees WITH THE FAST TRANSLATION. Experimental, UI-toggled."""
+        try:
+            polished = await ark_polisher.translate(text, src, tgt, context=ctx)
+        except Exception as e:
+            print(f"[polish] failed: {e}", file=sys.stderr)
+            return
+        if not polished or polished == fast:
+            return
+        if ui:
+            await ui.emit({"type": "translation", "id": seg_id,
+                           "text": polished, "polish": True})
+        for r in transcript_records:
+            if r["seq"] == seg_id:
+                r["translation"] = polished
+        await asyncio.to_thread(_append_jsonl, jsonl_path,
+                                {"seq": seg_id, "polish": polished})
 
     async def flush_line() -> None:
         nonlocal seg_seq
@@ -593,6 +676,15 @@ async def run(args) -> None:
                 break
             reconnects += 1
             announced_connected = False
+            # drain the audio queue: buffered chunks belong to the dead
+            # session, and sending them to the new one re-recognizes speech
+            # that may already be committed. Lose a few seconds of audio
+            # rather than duplicate captions.
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             delay = min(2 * reconnects, 10)
             print(f"[asr] reconnecting in {delay}s (attempt {reconnects})", file=sys.stderr)
             if ui:
@@ -615,6 +707,20 @@ async def run(args) -> None:
             task.cancel()
         if translate_tasks:
             await asyncio.gather(*translate_tasks, return_exceptions=True)
+        if polish_tasks:
+            await asyncio.gather(*polish_tasks, return_exceptions=True)
+        if new_corrections:
+            # merge into the on-disk glossary without dumping runtime-added
+            # identity terms back into the curated file
+            try:
+                with open(args.glossary, encoding="utf-8") as f:
+                    disk = json.load(f)
+                disk.setdefault("corrections", {}).update(new_corrections)
+                with open(args.glossary, "w", encoding="utf-8") as f:
+                    json.dump(disk, f, ensure_ascii=False, indent=2)
+                print(f"[corrections] persisted {len(new_corrections)} to glossary.json")
+            except OSError as e:
+                print(f"[corrections] cannot persist: {e}", file=sys.stderr)
         if transcript_records:
             md_path = jsonl_path.replace(".jsonl", ".md")
             with open(md_path, "w", encoding="utf-8") as f:
@@ -623,7 +729,8 @@ async def run(args) -> None:
                     who = (f"Speaker {int(r['speaker']) + 1}"
                            if r["speaker"] is not None and str(r["speaker"]).isdigit()
                            else r["speaker"] or "")
-                    f.write(f"**{who}** ({r['lang']}): {r['source']}\n\n"
+                    when = r.get("time", "")
+                    f.write(f"**{who}** ({r['lang']}) [{when}]: {r['source']}\n\n"
                             f"> {r['translation']}\n\n")
             print(f"[transcript] saved {jsonl_path} and {md_path}")
         sys.stdout.write("\n")

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 
 import websockets
 from websockets.datastructures import Headers
@@ -36,6 +37,12 @@ class CaptionUI:
         self.clients: dict[asyncio.Queue, asyncio.Task] = {}
         self.history: list[dict] = []  # replayed to late-joining browsers
         self.share: dict = {}  # {"lan": url, "public": url}, sent to every client
+        self.on_control = None  # async callback for UI control messages
+        # Control token: required on every control message. It is printed to
+        # the local terminal and injected into the page ONLY for direct
+        # loopback connections — cloudflared forwards public traffic to
+        # loopback, so source IP alone cannot prove "host" (audit F1).
+        self.control_token = secrets.token_urlsafe(8)
 
     async def set_share(self, lan: str | None, public: str | None) -> None:
         self.share = {k: v for k, v in (("lan", lan), ("public", public)) if v}
@@ -84,7 +91,25 @@ class CaptionUI:
                 for event in self.history:
                     await ws.send(json.dumps(event, ensure_ascii=False))
                 self.clients[outbox] = task
-                await ws.wait_closed()
+                # control channel: corrections, toggles. A connection earns
+                # the control token only if it is loopback AND not tunneled
+                # (cloudflared marks forwarded traffic with Cf-* headers).
+                host = (ws.remote_address or ("",))[0]
+                req_headers = getattr(getattr(ws, "request", None), "headers", {})
+                tunneled = "Cf-Connecting-Ip" in req_headers or "Cf-Ray" in req_headers
+                if host in ("127.0.0.1", "::1") and not tunneled:
+                    await ws.send(json.dumps(
+                        {"type": "control_token", "token": self.control_token}))
+                async for raw in ws:
+                    if not self.on_control:
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if (isinstance(msg, dict)
+                            and msg.get("token") == self.control_token):
+                        await self.on_control(msg)
             finally:
                 self.clients.pop(outbox, None)
                 task.cancel()
