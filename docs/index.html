@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CKB mBabel</title>
+<title>CKB mBabel · Live Demo</title>
 <style>
   :root {
     --paper: #F7F4ED; --ink: #211F1A; --ink-2: #57534A; --ink-3: #8F897C;
@@ -243,7 +243,7 @@
 <button id="pres-exit" title="退出投屏 Exit presentation">✕ 退出投屏 Exit</button>
 <header>
   <span class="wordmark">m<i>Babel</i></span>
-  <span class="session-meta" id="session-meta">中英双语字幕</span>
+  <span class="session-meta" id="session-meta">Live demo · 演示回放(脚本重演,非真实会议)</span>
   <nav>
     <select id="view-sel" title="选你阅读的语言 Pick your reading language">
       <option value="both">双语对照 Both</option>
@@ -596,7 +596,101 @@ function connect() {
     }
   };
 }
-connect();
+// ================= DEMO DRIVER (GitHub Pages) =================
+// No live socket here: this page replays a scripted CKB dev standup so
+// visitors can watch the real pipeline rhythm (hearing -> draft ->
+// commit -> promoted draft -> context-refined) and click every control.
+setLive(''); liveDot.textContent = 'DEMO';
+sessionNames['0'] = 'Hongzhou'; sessionNames['1'] = 'Matt'; sessionNames['2'] = 'Vicky';
+const DEMO = [
+ {sp:'0', lang:'zh',
+  src:'我们先过一下 Fiber 这边的进展,上周说的 watchtower 方案已经在 testnet 上跑通了。',
+  draft:"Let's go over Fiber first — the watchtower plan is now running on testnet.",
+  tr:"Let's start with Fiber: the watchtower design we discussed went live on testnet last week."},
+ {sp:'1', lang:'en',
+  src:'Nice. Did you measure the extra latency when the LSP bundles JIT channels with the watchtower?',
+  draft:'不错。LSP 把 JIT 通道和 watchtower 打包时,额外延迟测了吗?',
+  tr:'太好了。LSP 把 JIT 通道和 watchtower 服务打包时,额外延迟你们测过吗?'},
+ {sp:'0', lang:'zh',
+  src:'测了,首跳大概多两百毫秒,主要花在通道打开的签名交互上。',
+  draft:'Yes — about 200ms more on the first hop, mostly channel-open signing.',
+  tr:'We did: roughly 200ms extra on the first hop, mostly spent on the channel-open signing round-trip.'},
+ {sp:'2', lang:'en',
+  src:"For a mobile wallet that's acceptable, but let's hide it behind the payment animation.",
+  draft:'对移动钱包可以接受,但要藏进支付动画里。',
+  tr:'对移动钱包来说可以接受,不过我们应该把它藏进支付动画里。'},
+ {sp:'0', lang:'zh',
+  src:'同意。另外 RGB++ 的同构绑定在新版 CKB-VM 上要重新跑一遍兼容性测试。',
+  draft:'Agreed. RGB++ isomorphic binding needs a compatibility pass on the new CKB-VM.',
+  tr:"Agreed — and RGB++'s isomorphic binding needs a fresh compatibility pass on the new CKB-VM release."},
+ {sp:'1', lang:'en',
+  src:'One more thing: the async payment path still assumes the receiver comes back within 24 hours.',
+  draft:'还有,异步支付路径仍假设收款方 24 小时内回来。',
+  tr:'还有一件事:异步支付路径目前仍假设收款方会在 24 小时内回来。'},
+ {sp:'2', lang:'zh',
+  src:'这个窗口太乐观了,跨时区的用户经常两三天不开钱包。',
+  draft:'That window is optimistic — users often leave the wallet closed for days.',
+  tr:'That window is optimistic: cross-timezone users often leave the wallet closed for two or three days.'},
+ {sp:'1', lang:'en',
+  src:"Fair. Let's make the hold time configurable per channel and default it to 72 hours.",
+  draft:'有道理。保留时长按通道可配置,默认 72 小时。',
+  tr:'有道理。那就把保留时长做成每个通道可配置,默认 72 小时。'},
+ {sp:'0', lang:'zh',
+  src:'行,我写进 RFC。测试网水龙头这周也要补一下,社区反馈领不到测试币。',
+  draft:"Deal, I'll add it to the RFC. Also refill the testnet faucet this week.",
+  tr:"Deal — I'll put it in the RFC. And let's refill the testnet faucet this week; the community says it's dry."},
+ {sp:'2', lang:'en',
+  src:"I'll ping the infra team right after this call. Anything else before we wrap up?",
+  draft:'会后我去找 infra 团队。收尾前还有别的吗?',
+  tr:'会后我马上去找 infra 团队。收尾之前还有其他议题吗?'}
+];
+const dsleep = (ms) => new Promise(r => setTimeout(r, ms));
+function demoReset() {
+  script.textContent = '';
+  history.length = 0;
+  seenIds.clear();
+  for (const k of Object.keys(transById)) delete transById[k];
+  hearing.textContent = ''; drafting.textContent = '';
+  drafting.classList.remove('on');
+}
+async function playTurn(ev, id, ts) {
+  const src = ev.src, steps = Math.ceil(src.length / 3);
+  for (let i = 1; i <= steps; i++) {
+    hearing.textContent = tailTrim(src.slice(0, i * 3));
+    if (i % 4 === 2) {
+      const frac = Math.min(1, i / steps + 0.1);
+      drafting.textContent = tailTrim(ev.draft.slice(0, Math.ceil(ev.draft.length * frac)));
+      drafting.classList.add('on');
+    }
+    await dsleep(115);
+  }
+  drafting.textContent = tailTrim(ev.draft); drafting.classList.add('on');
+  await dsleep(500);
+  hearing.textContent = ''; drafting.textContent = ''; drafting.classList.remove('on');
+  const committed = {id, lang: ev.lang, source: src, speaker: ev.sp, ts};
+  if (!seenIds.has(id)) history.push(committed);
+  appendSentence(committed);
+  await dsleep(250);
+  addTranslation({id, text: ev.draft, provisional: true});
+  await dsleep(1500);
+  addTranslation({id, text: ev.tr});
+  await dsleep(900);
+}
+async function runDemo() {
+  let cycle = 0;
+  while (true) {
+    demoReset();
+    let ts = 725;
+    for (let i = 0; i < DEMO.length; i++) {
+      await playTurn(DEMO[i], cycle * 100 + i + 1, ts);
+      ts += 18 + (i * 7) % 21;
+    }
+    await dsleep(5000);
+    cycle++;
+  }
+}
+runDemo();
+// =============== END DEMO DRIVER ===============
 
 // ---- modals ----
 for (const el of document.querySelectorAll('.close')) {

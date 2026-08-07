@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +53,12 @@ class Glossary:
         return "\n".join(lines)
 
 
+class RateLimitError(RuntimeError):
+    """volc-mt reports quota exhaustion as HTTP 500 with body
+    {"code": 55000000, "message": "quota exceeded for types: qpm"}.
+    Distinct type so callers can back off longer."""
+
+
 class VolcMtTranslator:
     """Volcengine speech-product machine translation (matx_translate).
 
@@ -89,6 +96,9 @@ class VolcMtTranslator:
             {s: t for s, t in forward.items() if s == t})
         self.backward_lite = with_case_variants(
             {t: s for s, t in forward.items() if s == t})
+        # token accounting per call type: {"draft"|"refined": [prompt, completion, calls]}
+        self.usage = {"draft": [0, 0, 0], "refined": [0, 0, 0]}
+        self.fail_streak = 0  # consecutive failures; the service flaps in bursts
         self.client = httpx.AsyncClient(timeout=15.0, trust_env=False)
 
     async def translate(self, text: str, source_lang: str, target_lang: str,
@@ -116,11 +126,42 @@ class VolcMtTranslator:
             "Content-Type": "application/json",
         }
         resp = await self.client.post(self.URL, json=body, headers=headers)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            self.fail_streak += 1
+            snippet = resp.text[:300]
+            if "quota exceeded" in snippet:
+                raise RateLimitError(
+                    f"volc-mt rate limit (HTTP {resp.status_code}): {snippet}")
+            resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 20000000:
-            raise RuntimeError(f"volc-mt error: {data.get('code')} {data.get('message')}")
-        return data["data"]["translation_list"][0]["translation"].strip()
+            self.fail_streak += 1
+            msg = data.get("message") or ""
+            if "quota exceeded" in msg:
+                raise RateLimitError(
+                    f"volc-mt rate limit: {msg} "
+                    f"(logid {resp.headers.get('X-Tt-Logid', '')})")
+            raise RuntimeError(f"volc-mt error: {data.get('code')} {msg}")
+        self.fail_streak = 0
+        item = data["data"]["translation_list"][0]
+        usage = item.get("usage") or {}
+        bucket = self.usage["draft" if lite else "refined"]
+        bucket[0] += usage.get("prompt_tokens", 0)
+        bucket[1] += usage.get("completion_tokens", 0)
+        bucket[2] += 1
+        return item["translation"].strip()
+
+
+# reasoning-leak markers: meta-commentary English words that should never
+# appear in a zh translation (observed once: mini deliberating in output)
+_LEAK_MARKERS = ("Wait,", "wait no", "source text", "target language",
+                 "the user's", "Let's translate", "let's translate",
+                 "looking again")
+
+
+def _looks_like_reasoning(out: str) -> bool:
+    hits = sum(1 for m in _LEAK_MARKERS if m in out)
+    return hits >= 2
 
 
 class ArkTranslator:
@@ -143,6 +184,7 @@ class ArkTranslator:
             self.client = AsyncArk(ak=ak, sk=sk)
         else:
             raise ValueError("Ark auth missing: set ARK_API_KEY, or AccessKeyID + SecretAccessKey")
+        self.usage = [0, 0, 0]  # [prompt_tokens, completion_tokens, calls]
         self.model = model
         domain_note = f" Domain: {glossary.domains}." if glossary.domains else ""
         self.system_prompt = (
@@ -150,7 +192,8 @@ class ArkTranslator:
             f"{domain_note}\n"
             "Translate the user's text between Chinese and English. "
             "The target language is given in square brackets. "
-            "Output ONLY the translation, no quotes, no explanation.\n"
+            "Output ONLY the translation: no quotes, no explanation, and NEVER "
+            "any acknowledgment or conversational prefix such as '好的' or '收到'.\n"
             "Use these terminology mappings exactly:\n"
             f"{glossary.render_table()}"
         )
@@ -167,21 +210,33 @@ class ArkTranslator:
             )
         else:
             user = f"[{target_lang}] {text}"
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.1,
-            max_tokens=512,
-            # Doubao Seed 2.x defaults to thinking mode: it burns hundreds of
-            # reasoning tokens and several seconds before answering. Useless
-            # for translation, so disable it (17s -> ~2s on a sentence).
-            extra_body={"thinking": {"type": "disabled"}},
-            extra_headers={"X-Project-Name": "default"},
-        )
-        return (resp.choices[0].message.content or "").strip()
+
+        for attempt in range(2):  # second try only on reasoning-leak output
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.1,
+                max_tokens=512,
+                # Doubao Seed 2.x defaults to thinking mode: it burns hundreds of
+                # reasoning tokens and several seconds before answering. Useless
+                # for translation, so disable it (17s -> ~2s on a sentence).
+                extra_body={"thinking": {"type": "disabled"}},
+                extra_headers={"X-Project-Name": "default"},
+            )
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                self.usage[0] += getattr(usage, "prompt_tokens", 0) or 0
+                self.usage[1] += getattr(usage, "completion_tokens", 0) or 0
+                self.usage[2] += 1
+            out = (resp.choices[0].message.content or "").strip()
+            if not _looks_like_reasoning(out):
+                return out
+            print("[translate] reasoning-leak detected, retrying once",
+                  file=sys.stderr)
+        return out  # rare: return as-is rather than drop the line
 
 
 class QwenMtTranslator:
@@ -218,7 +273,7 @@ def build_translator(backend: str, glossary: Glossary, model: str | None = None)
     if backend == "ark":
         return ArkTranslator(
             glossary,
-            model=model or os.environ.get("ARK_MODEL", "doubao-seed-2-0-lite-260215"),
+            model=model or os.environ.get("ARK_MODEL", "doubao-seed-2-0-mini-260215"),
         )
     if backend == "qwen-mt":
         return QwenMtTranslator(glossary, model=model or "qwen-mt-plus")

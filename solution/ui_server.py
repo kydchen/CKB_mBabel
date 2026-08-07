@@ -34,7 +34,7 @@ class CaptionUI:
         self.host = host
         self.port = port
         self.token = token
-        self.clients: dict[asyncio.Queue, asyncio.Task] = {}
+        self.clients: dict[asyncio.Queue, tuple] = {}  # outbox -> (sender task, ws)
         self.history: list[dict] = []  # replayed to late-joining browsers
         self.share: dict = {}  # {"lan": url, "public": url}, sent to every client
         self.on_control = None  # async callback for UI control messages
@@ -62,7 +62,10 @@ class CaptionUI:
                 return Response(
                     200,
                     "OK",
-                    Headers({"Content-Type": "text/html; charset=utf-8"}),
+                    Headers({
+                        "Content-Type": "text/html; charset=utf-8",
+                        "Cache-Control": "no-store",  # never serve a stale UI
+                    }),
                     html,
                 )
             return None
@@ -90,7 +93,7 @@ class CaptionUI:
                         {"type": "share", **self.share}, ensure_ascii=False))
                 for event in self.history:
                     await ws.send(json.dumps(event, ensure_ascii=False))
-                self.clients[outbox] = task
+                self.clients[outbox] = (task, ws)
                 # control channel: corrections, toggles. A connection earns
                 # the control token only if it is loopback AND not tunneled
                 # (cloudflared marks forwarded traffic with Cf-* headers).
@@ -100,16 +103,19 @@ class CaptionUI:
                 if host in ("127.0.0.1", "::1") and not tunneled:
                     await ws.send(json.dumps(
                         {"type": "control_token", "token": self.control_token}))
-                async for raw in ws:
-                    if not self.on_control:
-                        continue
-                    try:
-                        msg = json.loads(raw)
-                    except (TypeError, ValueError):
-                        continue
-                    if (isinstance(msg, dict)
-                            and msg.get("token") == self.control_token):
-                        await self.on_control(msg)
+                try:
+                    async for raw in ws:
+                        if not self.on_control:
+                            continue
+                        try:
+                            msg = json.loads(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if (isinstance(msg, dict)
+                                and msg.get("token") == self.control_token):
+                            await self.on_control(msg)
+                except websockets.exceptions.ConnectionClosed:
+                    pass  # client gone (or force-closed as too slow); cleanup below
             finally:
                 self.clients.pop(outbox, None)
                 task.cancel()
@@ -122,9 +128,14 @@ class CaptionUI:
         if event["type"] in ("committed", "translation"):
             self.history.append(event)  # replayed to late-joining browsers
         msg = json.dumps(event, ensure_ascii=False)
-        for outbox, task in list(self.clients.items()):
+        for outbox, (task, ws) in list(self.clients.items()):
             try:
                 outbox.put_nowait(msg)
             except asyncio.QueueFull:
-                task.cancel()  # too slow: cut the client off
+                # too slow: actually CLOSE the connection (code 1013), so the
+                # browser's onclose fires and its reconnect+replay path
+                # catches the viewer back up. Just cancelling the sender
+                # would leave an open-but-dead socket: frozen page, green dot.
+                task.cancel()
                 self.clients.pop(outbox, None)
+                asyncio.create_task(ws.close(code=1013))

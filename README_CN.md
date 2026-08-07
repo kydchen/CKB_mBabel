@@ -6,6 +6,8 @@
 
 本地不存音频,音频由火山引擎云端 API 处理。
 
+**在线演示:** https://kydchen.github.io/CKB_mBabel/ —— 一场双语站会的脚本重演,所有控件可点,无需任何配置。
+
 ![界面](docs/screenshot.png)
 
 ## 功能

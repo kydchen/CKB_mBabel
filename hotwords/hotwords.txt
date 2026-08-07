@@ -1,6 +1,7 @@
 Nervos
 Nervape
 CKB
+GA
 NervosDAO
 Meepo
 Eaglesong

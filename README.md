@@ -6,6 +6,8 @@ Real-time bilingual (zh↔en) meeting captions. Listens to a meeting, shows the 
 
 No audio is stored locally; audio is processed by Volcengine cloud APIs.
 
+**Live demo:** https://kydchen.github.io/CKB_mBabel/ — a simulated replay of a bilingual dev standup; click through every control, no setup needed.
+
 ![layout](docs/screenshot.png)
 
 ## Features

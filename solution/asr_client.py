@@ -68,6 +68,7 @@ class AsrConfig:
     enable_nonstream: bool = True  # two-pass: fast interim + accurate definite
     enable_speaker_info: bool = True  # speaker clustering, needs nonstream + ssd 200
     ssd_version: str = "200"
+    enable_lid: bool = True  # per-segment language labels (speech_en/speech_mand…)
     end_window_size: int = 800  # ms of silence that closes a segment
     enable_ddc: bool = False  # disfluency smoothing
     uid: str = "babel"
@@ -98,6 +99,7 @@ def _build_full_request(config: AsrConfig) -> bytes:
             "enable_nonstream": config.enable_nonstream,
             "enable_speaker_info": config.enable_speaker_info,
             "ssd_version": config.ssd_version,
+            "enable_lid": config.enable_lid,
             "end_window_size": config.end_window_size,
             "show_utterances": True,
             "result_type": "single",

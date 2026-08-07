@@ -415,20 +415,23 @@ async def run(args) -> None:
         )
     )
 
-    # Context polish (experimental, UI toggle): after the fast refined pass,
-    # an ark model re-translates with the previous sentences as context and
-    # updates the line in place when it disagrees. Built lazily-safe.
-    polish_state = {"enabled": False}
+    # Refined translation engine (ark with sentence context since W1); the
+    # volc-mt translator stays as fallback when ark credentials are absent.
     ark_polisher = None
     try:
         ark_polisher = ArkTranslator(
-            glossary, model=os.environ.get("ARK_MODEL", "doubao-seed-2-0-lite-260215")
+            glossary, model=os.environ.get("ARK_MODEL", "doubao-seed-2-0-mini-260215")
         )
     except Exception:
-        print("[polish] ark backend unavailable; the polish toggle will no-op")
+        print("[translate] ark backend unavailable; refined falls back to volc-mt")
+
+    def stats_snapshot() -> dict:
+        now = time.time()
+        return {k: sum(1 for t in dq if now - t < 60)
+                for k, dq in req_stats.items()}
 
     async def on_control(msg: dict) -> None:
-        """Control messages from the UI (localhost-guarded in ui_server)."""
+        """Control messages from the UI (token-guarded in ui_server)."""
         kind = msg.get("type")
         if kind == "correction":
             wrong = (msg.get("wrong") or "").strip()
@@ -449,11 +452,9 @@ async def run(args) -> None:
                     await ui.emit({"type": "status",
                                    "text": f"ddc {'on' if enabled else 'off'}, ASR restarting…"})
                 await asr.close()
-        elif kind == "polish":
-            polish_state["enabled"] = bool(msg.get("enabled"))
+        elif kind == "stats":
             if ui:
-                await ui.emit({"type": "status",
-                               "text": f"context polish {'on' if polish_state['enabled'] else 'off'}"})
+                await ui.emit({"type": "stats", **stats_snapshot()})
 
     if ui:
         ui.on_control = on_control
@@ -473,7 +474,6 @@ async def run(args) -> None:
 
     committed: set[tuple[int, int]] = set()
     translate_tasks: list[asyncio.Task] = []
-    polish_tasks: list[asyncio.Task] = []
     draft_tasks: list[asyncio.Task] = []  # cancelled on flush: finals have priority
     cache: dict[str, str] = {}
     recent_sources: list[str] = []  # last committed originals, context for polish
@@ -488,11 +488,20 @@ async def run(args) -> None:
     # (mid-sentence pauses) into tiny cards and flooding the translator.
     line_parts: list[str] = []
     line_speaker: dict = {"id": None}  # speaker_id of the current live line
+    line_misrec = {"v": False}  # lid said English but the text came out Chinese
     FINAL_PUNCT = ("。", "！", "？", ".", "!", "?", "…")
     FILLER_RE = re.compile(r"^[嗯哦呃啊唉哼哈唔呐吧嘛呀哎\s,.，。！？!?…~～]+$")
     MAX_LINE_CHARS = 200
     FLUSH_SILENCE_S = 2.0  # flush the live line after this much ASR quiet time
     last_activity = {"t": 0.0}
+
+    draft_sem = asyncio.Semaphore(3)  # drafts never starve the refined pass
+    fail_stats: dict = {}
+    from collections import deque
+    # request counters for the Lab stats line (60s sliding window per channel)
+    req_stats = {"volc_draft": deque(), "volc_refined": deque(), "ark": deque(),
+                 "ratelimit": deque()}
+    last_draft_result = {"text": "", "src": "", "time": 0.0}
 
     async def draft_translate(text: str, seq: int) -> None:
         """Translate the still-growing sentence for a live draft. Any draft
@@ -501,87 +510,135 @@ async def run(args) -> None:
         speed instead of collapsing to sentence end."""
         try:
             src, tgt = detect_direction(text)
-            translated = await translator.translate(text, src, tgt, lite=True)
+            req_stats["volc_draft"].append(time.time())
+            async with draft_sem:
+                translated = await translator.translate(text, src, tgt, lite=True)
         except Exception:
             return
+        last_draft_result.update(text=translated, src=src, time=time.time())
         if ui and seq > last_draft_emit["seq"]:
             last_draft_emit["seq"] = seq
-            await ui.emit({"type": "draft", "text": translated})
+            await ui.emit({"type": "draft", "text": translated, "lang": src})
 
-    async def commit(text: str, seg_id: int, speaker: str | None) -> None:
+    async def commit(text: str, seg_id: int, speaker: str | None,
+                     misrec: bool = False, draft_snap: dict | None = None) -> None:
         src, tgt = detect_direction(text)
         arrow = "中→英" if src == "zh" else "EN→中"
         ts = round(time.time() - session_t0, 1)
         if ui:
             await ui.emit({"type": "committed", "id": seg_id, "lang": src,
-                           "source": text, "speaker": speaker, "ts": ts})
+                           "source": text, "speaker": speaker, "ts": ts,
+                           "misrec": misrec})
+
+        # W1 draft promotion: the last draft of THIS sentence becomes the
+        # provisional translation the moment the sentence commits — the line
+        # is immediately readable, marked ≈, replaced by the refined pass.
+        provisional = None
+        ld = draft_snap or {"text": "", "src": "", "time": 0.0}
+        if ld["text"] and ld["src"] == src and time.time() - ld["time"] < 3.0:
+            provisional = ld["text"]
+            if ui:
+                await ui.emit({"type": "translation", "id": seg_id,
+                               "text": provisional, "provisional": True})
+
+        ctx = recent_sources[-2:]
+        recent_sources.append(text)
+        # refined pass: ark with the previous sentences as context (default
+        # since W1); volc-mt stays as fallback when ark credentials are absent
+        translated = None
         if text in cache:
             translated = cache[text]
         else:
-            try:
-                translated = await translator.translate(text, src, tgt)
-            except Exception as e:
-                print(f"[translate] {e}; retrying once", file=sys.stderr)
-                await asyncio.sleep(1)
+            engine = ark_polisher if ark_polisher is not None else translator
+            waits = [1, 3]
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(waits[attempt - 1])
                 try:
-                    translated = await translator.translate(text, src, tgt)
-                except Exception as e2:
-                    print(f"[translate] failed: {e2}", file=sys.stderr)
-                    translated = "⚠ 翻译失败 translation unavailable"
-            if not translated.startswith("⚠"):
+                    req_stats["ark" if engine is ark_polisher else "volc_refined"].append(time.time())
+                    if engine is ark_polisher:
+                        translated = await engine.translate(text, src, tgt, context=ctx)
+                    else:
+                        translated = await engine.translate(text, src, tgt)
+                    break
+                except Exception as e:
+                    key = type(e).__name__
+                    fail_stats[key] = fail_stats.get(key, 0) + 1
+                    if key == "RateLimitError":
+                        req_stats["ratelimit"].append(time.time())
+                    print(f"[translate] attempt {attempt + 1} failed: {e} "
+                          f"(totals: {fail_stats})", file=sys.stderr)
+                    if key == "RateLimitError":
+                        waits = [5, 15]
+            if translated is None:
+                # both engines failed: the provisional draft is still a
+                # readable line; schedule quiet backfills
+                translated = provisional or "⚠ 翻译失败 translation unavailable"
+                translate_tasks.append(
+                    asyncio.create_task(backfill(text, seg_id, src, tgt, ctx))
+                )
+            else:
                 cache[text] = translated  # never cache the failure placeholder
-        if ui:
+        if ui and translated != provisional:
+            await ui.emit({"type": "translation", "id": seg_id, "text": translated})
+        elif ui and provisional is None:
             await ui.emit({"type": "translation", "id": seg_id, "text": translated})
         record = {"seq": seg_id, "speaker": speaker, "lang": src,
                   "source": text, "translation": translated,
                   "ts": ts, "time": time.strftime("%H:%M:%S")}
         transcript_records.append(record)
         await asyncio.to_thread(_append_jsonl, jsonl_path, record)
-        ctx = recent_sources[-2:]
-        recent_sources.append(text)
-        if polish_state["enabled"] and ark_polisher is not None:
-            polish_tasks.append(
-                asyncio.create_task(polish(text, seg_id, src, tgt, ctx, translated))
-            )
         sys.stdout.write(
             f"{CLEAR_LINE}{DIM}[{arrow}] {text}{RESET}\n{BOLD}{translated}{RESET}\n"
         )
         sys.stdout.flush()
 
-    async def polish(text: str, seg_id: int, src: str, tgt: str,
-                     ctx: list[str], fast: str) -> None:
-        """Optional fourth pass: ark model with previous sentences as context.
-        Runs after the fast refined pass; updates the line only when it
-        disagrees WITH THE FAST TRANSLATION. Experimental, UI-toggled."""
-        try:
-            polished = await ark_polisher.translate(text, src, tgt, context=ctx)
-        except Exception as e:
-            print(f"[polish] failed: {e}", file=sys.stderr)
+    async def backfill(text: str, seg_id: int, src: str, tgt: str,
+                     ctx: list[str]) -> None:
+        """A failed refined translation is retried quietly every 15s for up
+        to ~3 minutes, same engine as the refined pass (ark with context
+        when available); on success the line updates in place."""
+        engine = ark_polisher if ark_polisher is not None else translator
+        for _ in range(12):
+            await asyncio.sleep(15)
+            try:
+                if engine is ark_polisher:
+                    fixed = await engine.translate(text, src, tgt, context=ctx)
+                else:
+                    fixed = await engine.translate(text, src, tgt)
+            except Exception:
+                continue
+            cache[text] = fixed
+            if ui:
+                await ui.emit({"type": "translation", "id": seg_id, "text": fixed})
+            for r in transcript_records:
+                if r["seq"] == seg_id:
+                    r["translation"] = fixed
+            await asyncio.to_thread(_append_jsonl, jsonl_path,
+                                    {"seq": seg_id, "backfill": fixed})
             return
-        if not polished or polished == fast:
-            return
-        if ui:
-            await ui.emit({"type": "translation", "id": seg_id,
-                           "text": polished, "polish": True})
-        for r in transcript_records:
-            if r["seq"] == seg_id:
-                r["translation"] = polished
-        await asyncio.to_thread(_append_jsonl, jsonl_path,
-                                {"seq": seg_id, "polish": polished})
 
     async def flush_line() -> None:
         nonlocal seg_seq
         text = "".join(line_parts).strip()
         speaker = line_speaker["id"]
+        misrec = line_misrec["v"]
         line_parts.clear()
         line_speaker["id"] = None
+        line_misrec["v"] = False
         for task in draft_tasks:  # stale drafts are obsolete once a line commits
             task.cancel()
         draft_tasks.clear()
+        # snapshot the draft that belongs to THIS line and clear the slot:
+        # a short next sentence committing within 3s must never promote the
+        # previous sentence's draft as its own provisional translation
+        draft_snap = dict(last_draft_result)
+        last_draft_result.update(text="", src="", time=0.0)
         if not text or FILLER_RE.match(text):
             return  # drop pure fillers (嗯/哦/呃…) entirely
         seg_seq += 1
-        translate_tasks.append(asyncio.create_task(commit(text, seg_seq, speaker)))
+        translate_tasks.append(
+            asyncio.create_task(commit(text, seg_seq, speaker, misrec, draft_snap)))
 
     async def silence_watchdog() -> None:
         """Flush the live line when the ASR has been quiet for a while; real
@@ -631,7 +688,13 @@ async def run(args) -> None:
                                 await flush_line()
                             # language-boundary split, also inside a single fragment:
                             # a speaker can switch languages mid-utterance
+                            lid = (utt.get("additions") or {}).get("lid_lang")
                             for piece_lang, piece in split_lang_runs(frag):
+                                # lid says English speech but the text came out
+                                # Chinese: LLM-ASR translated instead of
+                                # transcribing. Mark the line as suspect.
+                                if lid == "speech_en" and piece_lang == "zh":
+                                    line_misrec["v"] = True
                                 if (line_parts and len(piece.strip()) >= 6
                                         and piece_lang != dominant_lang("".join(line_parts))):
                                     await flush_line()
@@ -645,9 +708,17 @@ async def run(args) -> None:
                         line = "".join(line_parts) + correct(event.text)
                         text = line.strip()
                         now = asyncio.get_running_loop().time()
-                        debounce = 0.5  # fixed: adaptive debounce read as "slower"
+                        # Draft budget: QPM is per-account and reserved for
+                        # drafts. Fire at most every 0.6s, and skip when the
+                        # line grew by <6 chars in <2s (nothing new to say).
+                        # While rate-limited, slow further to 2.5s.
+                        streak = getattr(translator, "fail_streak", 0)
+                        debounce = 2.5 if streak >= 2 else 0.6
+                        grown = len(text) - len(last_draft["text"])
+                        due = now - last_draft["time"]
                         if (ui and len(text) >= 4 and text != last_draft["text"]
-                                and now - last_draft["time"] >= debounce):
+                                and (grown >= 6 or due >= 2.0)
+                                and due >= debounce):
                             last_draft.update(text=text, time=now)
                             draft_seq += 1
                             draft_tasks.append(
@@ -707,8 +778,6 @@ async def run(args) -> None:
             task.cancel()
         if translate_tasks:
             await asyncio.gather(*translate_tasks, return_exceptions=True)
-        if polish_tasks:
-            await asyncio.gather(*polish_tasks, return_exceptions=True)
         if new_corrections:
             # merge into the on-disk glossary without dumping runtime-added
             # identity terms back into the curated file
@@ -733,6 +802,23 @@ async def run(args) -> None:
                     f.write(f"**{who}** ({r['lang']}) [{when}]: {r['source']}\n\n"
                             f"> {r['translation']}\n\n")
             print(f"[transcript] saved {jsonl_path} and {md_path}")
+        # per-feature token accounting for the session
+        usage_report = {}
+        if hasattr(translator, "usage"):
+            u = translator.usage
+            if isinstance(u, dict):
+                for k, (p, c, n) in u.items():
+                    usage_report[f"volc-mt/{k}"] = {"prompt": p, "completion": c, "calls": n}
+        if ark_polisher is not None and getattr(ark_polisher, "usage", None):
+            p, c, n = ark_polisher.usage
+            usage_report["ark/polish"] = {"prompt": p, "completion": c, "calls": n}
+        if usage_report:
+            print(f"[usage] {json.dumps(usage_report, ensure_ascii=False)}")
+            await asyncio.to_thread(
+                _append_jsonl,
+                os.path.join(transcript_dir, "usage.jsonl"),
+                {"stamp": stamp, **usage_report},
+            )
         sys.stdout.write("\n")
 
 

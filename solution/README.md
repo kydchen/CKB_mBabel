@@ -112,3 +112,23 @@ Double-click `../Babel.command` in Finder (right-click → Open the first time).
 - Live correction (会中纠错): `wrong=right` in the Lab modal takes effect immediately and is persisted to `glossary.json` corrections on exit. Localhost-only; remote viewers cannot steer the pipeline.
 - Timestamps: every committed line carries a session-relative `ts` into the UI and the transcript; export offers SRT (.srt) alongside Markdown.
 - Silence flush lowered from 3.0s to 2.0s. On ASR reconnect the audio queue is drained — a few seconds of audio are sacrificed so the new session never re-recognizes already-committed speech.
+
+
+## UX iteration (2026-08-08, from real-meeting feedback)
+
+- Slow/stalled viewers are force-closed with WS code 1013 so the browser's reconnect+replay path catches them up (a cancelled sender alone left frozen-but-green pages).
+- Language view selector means "your reading language": single-language mode collapses originals and merges into one reading stream (your language shows the source, the rest shows the translation). Draft events carry a language tag and are filtered accordingly.
+- Layout: translations get 2/3 of the height and the bright text color (they are the reading face; originals are gray reference); sticky pane labels; permanent draft slot pinned to the pane bottom (no layout shift); divider button collapses originals to just the live line; latest settled sentence carries a subtle left-edge marker.
+- Translation robustness: drafts capped by a semaphore so they never starve refined commits; refined pass retries twice (1s/3s) with failure stats in stderr; a failed line auto-retries once more after 15s and updates in place.
+- Live correction relabeled "识别纠错 ASR correction" with the 陈红周=陈泓舟 example.
+
+
+## W1: draft promotion + context refined (2026-08-08 night)
+
+Root cause of the translation failures: volc-mt enforces a per-ACCOUNT QPM quota (misreported as HTTP 500, body code 55000000 "quota exceeded for types: qpm", effective ~55/min sustained). Dual-key pooling was disproven empirically (quota is per account). Current split:
+
+- Drafts stay on volc-mt (fast, lite identity glossary), cadence 0.6s with a <6-char-in-2s skip threshold; QPM budget is basically all theirs. 2.5s back-off while rate-limited.
+- On commit, the sentence's last draft is promoted immediately as the provisional translation (≈-marked, italic) — the line is readable at once, no "translating…" gap.
+- The refined pass runs on the ark model with the previous two sentences as context (glossary in system prompt); it replaces the provisional in place. The old separate "context polish" fourth pass is gone — context is the default. volc-mt remains the fallback engine when ark credentials are absent.
+- Backfills (every 15s, up to ~3 min) use the same ark engine. RateLimitError is classified separately with 5s/15s retry waits.
+- Lab modal shows 60s request counts per channel (draft/refined/rate-limited). Draft promotion removed the old polish toggle.
