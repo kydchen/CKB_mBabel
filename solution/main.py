@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import sys
 import time
 import wave
@@ -59,6 +60,16 @@ def load_hotwords_dir(path: str) -> list[str]:
 SAMPLE_RATE = 16000
 CHUNK_MS = 200  # 200ms per packet is optimal for the bidirectional endpoint
 CHUNK_BYTES = SAMPLE_RATE * CHUNK_MS // 1000 * 2  # s16le mono
+
+def print_safe(*args, **kwargs) -> None:
+    """print() that survives a dead pty: closing the terminal window delivers
+    SIGHUP with the tty already gone, so status prints during cleanup raise
+    EIO — and must never abort the transcript/glossary writes that follow."""
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
 
 # ANSI styles
 DIM = "\033[2m"
@@ -170,9 +181,11 @@ async def mic_chunks(queue: asyncio.Queue, device: int | str | None = None,
         dtype="int16",
         channels=channels,
         callback=callback,
-    ):
+    ) as stream:
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(0.5)
+            if not stream.active:
+                raise RuntimeError("audio input stream stopped")
 
 
 async def wav_chunks(path: str, queue: asyncio.Queue) -> None:
@@ -267,6 +280,29 @@ async def maybe_tunnel(port: int):
 
 
 async def run(args) -> None:
+    device = args.device
+    if isinstance(device, str):
+        try:
+            device = int(device)
+        except ValueError:
+            pass  # sounddevice accepts a device name substring
+    if not args.wav:
+        import sounddevice as sd
+
+        try:
+            info = sd.query_devices(device, "input")
+            max_channels = int(info["max_input_channels"])
+            if not 1 <= args.channels <= max_channels:
+                raise ValueError(
+                    f"requested {args.channels} channels, device supports {max_channels}"
+                )
+        except Exception as e:
+            print(f"[audio] cannot use input device {device!r}: {e}", file=sys.stderr)
+            print("[audio] available devices:", file=sys.stderr)
+            devices = sd.query_devices()
+            print(devices if len(devices) else "(none detected)", file=sys.stderr)
+            raise SystemExit(2)
+
     glossary = Glossary.load(args.glossary)
     # Merge hotword files: English/proper nouns become identity translation
     # terms (kept as-is, e.g. "Meepo"), Chinese entries only feed ASR.
@@ -460,19 +496,27 @@ async def run(args) -> None:
         ui.on_control = on_control
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
-    device = args.device
-    if isinstance(device, str):
-        try:
-            device = int(device)
-        except ValueError:
-            pass  # sounddevice accepts a device name substring
+    run_task = asyncio.current_task()
+    assert run_task is not None
+    audio_failure = {"error": None}
     producer = (
         asyncio.create_task(wav_chunks(args.wav, queue))
         if args.wav
         else asyncio.create_task(mic_chunks(queue, device=device, channels=args.channels))
     )
+    if not args.wav:
+        def audio_done(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                audio_failure["error"] = error
+                print(f"[audio] input failed: {error}", file=sys.stderr)
+                run_task.cancel()
 
-    committed: set[tuple[int, int]] = set()
+        producer.add_done_callback(audio_done)
+
+    committed: set[tuple[int, int, str]] = set()
     translate_tasks: list[asyncio.Task] = []
     draft_tasks: list[asyncio.Task] = []  # cancelled on flush: finals have priority
     cache: dict[str, str] = {}
@@ -634,6 +678,7 @@ async def run(args) -> None:
         # previous sentence's draft as its own provisional translation
         draft_snap = dict(last_draft_result)
         last_draft_result.update(text="", src="", time=0.0)
+        last_draft.update(text="")
         if not text or FILLER_RE.match(text):
             return  # drop pure fillers (嗯/哦/呃…) entirely
         seg_seq += 1
@@ -662,6 +707,9 @@ async def run(args) -> None:
     reconnects = 0
     ever_connected = False
     announced_connected = True  # flips False while disconnected
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        loop.add_signal_handler(sig, run_task.cancel)
     try:
         while True:  # ASR reconnect loop: survive network blips mid-meeting
             got_last = False
@@ -756,6 +804,7 @@ async def run(args) -> None:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+            committed.clear()
             delay = min(2 * reconnects, 10)
             print(f"[asr] reconnecting in {delay}s (attempt {reconnects})", file=sys.stderr)
             if ui:
@@ -765,13 +814,19 @@ async def run(args) -> None:
     except KeyboardInterrupt:
         pass
     except asyncio.CancelledError:
-        pass  # Ctrl-C under asyncio.run surfaces as task cancellation
+        if audio_failure["error"] is not None and ui:
+            await ui.emit({"type": "status", "text":
+                           f"audio input failed: {audio_failure['error']}"})
+            await asyncio.sleep(0)
     finally:
         await flush_line()  # Ctrl-C must not drop the line still accumulating
         producer.cancel()
         watchdog.cancel()
+        cleanup_tasks = [producer, watchdog]
         if share_task:
             share_task.cancel()  # terminates an in-flight cloudflared too
+            cleanup_tasks.append(share_task)
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
         if tunnel_proc:
             tunnel_proc.terminate()
         for task in draft_tasks:
@@ -787,9 +842,9 @@ async def run(args) -> None:
                 disk.setdefault("corrections", {}).update(new_corrections)
                 with open(args.glossary, "w", encoding="utf-8") as f:
                     json.dump(disk, f, ensure_ascii=False, indent=2)
-                print(f"[corrections] persisted {len(new_corrections)} to glossary.json")
+                print_safe(f"[corrections] persisted {len(new_corrections)} to glossary.json")
             except OSError as e:
-                print(f"[corrections] cannot persist: {e}", file=sys.stderr)
+                print_safe(f"[corrections] cannot persist: {e}", file=sys.stderr)
         if transcript_records:
             md_path = jsonl_path.replace(".jsonl", ".md")
             with open(md_path, "w", encoding="utf-8") as f:
@@ -801,7 +856,7 @@ async def run(args) -> None:
                     when = r.get("time", "")
                     f.write(f"**{who}** ({r['lang']}) [{when}]: {r['source']}\n\n"
                             f"> {r['translation']}\n\n")
-            print(f"[transcript] saved {jsonl_path} and {md_path}")
+            print_safe(f"[transcript] saved {jsonl_path} and {md_path}")
         # per-feature token accounting for the session
         usage_report = {}
         if hasattr(translator, "usage"):
@@ -813,13 +868,15 @@ async def run(args) -> None:
             p, c, n = ark_polisher.usage
             usage_report["ark/polish"] = {"prompt": p, "completion": c, "calls": n}
         if usage_report:
-            print(f"[usage] {json.dumps(usage_report, ensure_ascii=False)}")
+            print_safe(f"[usage] {json.dumps(usage_report, ensure_ascii=False)}")
             await asyncio.to_thread(
                 _append_jsonl,
                 os.path.join(transcript_dir, "usage.jsonl"),
                 {"stamp": stamp, **usage_report},
             )
-        sys.stdout.write("\n")
+        print_safe()
+    if audio_failure["error"] is not None:
+        raise SystemExit(f"[audio] input failed: {audio_failure['error']}")
 
 
 def main() -> None:
