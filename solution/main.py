@@ -65,6 +65,8 @@ CHUNK_BYTES = SAMPLE_RATE * CHUNK_MS // 1000 * 2  # s16le mono
 RECONNECT_TAIL_CHUNKS = 3000 // CHUNK_MS
 REPLAY_GUARD_SECONDS = 10.0
 REPLAY_GUARD_FRAGMENTS = 5
+CLAUSE_FLUSH_CHARS = 80
+CLAUSE_ENDINGS = ("，", "、", "；", ",", ";")
 
 
 def collect_reconnect_tail(sent_tail, queue: asyncio.Queue,
@@ -114,6 +116,13 @@ def merge_reconnect_partial(partial: str, replay: str) -> str:
     separator = (" " if prefix[-1].isascii() and prefix[-1].isalnum()
                  and suffix[0].isascii() and suffix[0].isalnum() else "")
     return prefix + separator + suffix
+
+
+def should_flush_clause(current: str, fragment: str) -> bool:
+    """Return whether a long live line reached a natural clause boundary."""
+    return (len(current) >= CLAUSE_FLUSH_CHARS
+            and fragment.rstrip().endswith(CLAUSE_ENDINGS))
+
 
 def print_safe(*args, **kwargs) -> None:
     """print() that survives a dead pty: closing the terminal window delivers
@@ -1231,7 +1240,9 @@ async def run(args) -> None:
                                     line_speaker["id"] = speaker
                                 line_parts.append(piece)
                                 current = "".join(line_parts).strip()
-                                if current.endswith(FINAL_PUNCT) or len(current) >= MAX_LINE_CHARS:
+                                if (current.endswith(FINAL_PUNCT)
+                                        or len(current) >= MAX_LINE_CHARS
+                                        or should_flush_clause(current, piece)):
                                     await flush_line()
                     # result.text can repeat a definite utterance from this
                     # same ASR packet. Once that utterance committed, treating

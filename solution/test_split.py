@@ -5,7 +5,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from main import split_lang_runs
+from main import should_flush_clause, split_lang_runs
 
 # CJK inside a would-be latin run must not be swallowed
 pieces = split_lang_runs('Fiber的feature是把Lightning Network的能力搬到CKB上')
@@ -26,4 +26,11 @@ assert [lang for lang, _ in pieces] == ['zh', 'en'], pieces
 pieces = split_lang_runs('然后呃我们可以，maybe，可能，呃，hi，Matt，可以听下你的想法了。')
 assert len(pieces) == 1 and pieces[0][0] == 'zh', pieces
 
-print('split_lang_runs: all asserts pass')
+# long lines flush only when the current fragment ends at a clause boundary
+fragment = '继续说明，'
+assert not should_flush_clause('前' * 74 + fragment, fragment)
+assert should_flush_clause('前' * 75 + fragment, fragment)
+fragment = '仍在同一个词中'
+assert not should_flush_clause('前' * 80 + fragment, fragment)
+
+print('split_lang_runs and clause flushing: all asserts pass')
