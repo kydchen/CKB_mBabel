@@ -137,6 +137,102 @@ def downmix_to_mono(data: bytes, channels: int) -> bytes:
     return out.tobytes()
 
 
+_COREAUDIO = None
+
+
+def coreaudio_devices() -> dict[int, str] | None:
+    """Return live macOS CoreAudio device IDs and names; None if unavailable."""
+    if sys.platform != "darwin":
+        return None
+
+    import ctypes
+
+    global _COREAUDIO
+    if _COREAUDIO is None:
+        class Address(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32),
+                        ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        ca = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+        )
+        cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        ca.AudioObjectGetPropertyDataSize.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(Address), ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+        ]
+        ca.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
+        ca.AudioObjectGetPropertyData.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(Address), ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+        ]
+        ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+        cf.CFStringGetCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+        ]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        _COREAUDIO = ca, cf, Address
+
+    ca, cf, Address = _COREAUDIO
+    fourcc = lambda value: int.from_bytes(value.encode(), "big")
+    device_list = Address(fourcc("dev#"), fourcc("glob"), 0)
+    size = ctypes.c_uint32()
+    if ca.AudioObjectGetPropertyDataSize(
+        1, ctypes.byref(device_list), 0, None, ctypes.byref(size)
+    ):
+        return None
+    ids = (ctypes.c_uint32 * (size.value // 4))()
+    if ca.AudioObjectGetPropertyData(
+        1, ctypes.byref(device_list), 0, None, ctypes.byref(size), ids
+    ):
+        return None
+
+    devices = {}
+    name_property = Address(fourcc("lnam"), fourcc("glob"), 0)
+    for device_id in ids:
+        name_ref = ctypes.c_void_p()
+        name_size = ctypes.c_uint32(ctypes.sizeof(name_ref))
+        if ca.AudioObjectGetPropertyData(
+            device_id, ctypes.byref(name_property), 0, None,
+            ctypes.byref(name_size), ctypes.byref(name_ref),
+        ):
+            continue
+        try:
+            name = ctypes.create_string_buffer(1024)
+            if cf.CFStringGetCString(name_ref, name, len(name), 0x08000100):
+                devices[int(device_id)] = name.value.decode()
+        finally:
+            cf.CFRelease(name_ref)
+    return devices
+
+
+def coreaudio_subdevices(device_id: int) -> set[int]:
+    """Return active subdevices for a macOS Aggregate Device."""
+    if _COREAUDIO is None:
+        return set()
+
+    import ctypes
+
+    ca, _, Address = _COREAUDIO
+    fourcc = lambda value: int.from_bytes(value.encode(), "big")
+    address = Address(fourcc("agrp"), fourcc("glob"), 0)
+    size = ctypes.c_uint32()
+    if ca.AudioObjectGetPropertyDataSize(
+        device_id, ctypes.byref(address), 0, None, ctypes.byref(size)
+    ):
+        return set()
+    ids = (ctypes.c_uint32 * (size.value // 4))()
+    if ca.AudioObjectGetPropertyData(
+        device_id, ctypes.byref(address), 0, None, ctypes.byref(size), ids
+    ):
+        return set()
+    return {int(value) for value in ids}
+
+
 async def mic_chunks(queue: asyncio.Queue, device: int | str | None = None,
                      channels: int = 1) -> None:
     """Capture mic audio with sounddevice; None signals end.
@@ -148,6 +244,12 @@ async def mic_chunks(queue: asyncio.Queue, device: int | str | None = None,
     import sounddevice as sd
 
     loop = asyncio.get_running_loop()
+    device_name = str(sd.query_devices(device, "input")["name"])
+    native_devices = coreaudio_devices()
+    native_ids = ({device_id for device_id, name in native_devices.items()
+                   if name == device_name} if native_devices is not None else set())
+    for device_id in tuple(native_ids):
+        native_ids.update(coreaudio_subdevices(device_id))
 
     dropped = {"n": 0}
 
@@ -186,6 +288,12 @@ async def mic_chunks(queue: asyncio.Queue, device: int | str | None = None,
             await asyncio.sleep(0.5)
             if not stream.active:
                 raise RuntimeError("audio input stream stopped")
+            current_devices = coreaudio_devices()
+            if (native_ids and current_devices is not None
+                    and not native_ids.issubset(current_devices)):
+                raise RuntimeError(
+                    f"audio input device or subdevice disconnected: {device_name}"
+                )
 
 
 async def wav_chunks(path: str, queue: asyncio.Queue) -> None:

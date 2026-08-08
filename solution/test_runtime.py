@@ -113,18 +113,33 @@ async def signal_check(temp_dir):
 
 
 async def audio_failure_check(temp_dir):
-    async def failed_mic(*_args, **_kwargs):
-        raise RuntimeError("simulated device disconnect")
-
     import sounddevice
 
-    with patch.object(sounddevice, "query_devices",
-                      return_value={"max_input_channels": 2}), \
-         patch.object(babel, "mic_chunks", failed_mic):
+    class LiveStream:
+        active = True
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    args = make_args(temp_dir, None)
+    args.device = "Aggregate Device"
+    with patch.object(sounddevice, "query_devices", return_value={
+            "name": "Aggregate Device", "max_input_channels": 4}), \
+         patch.object(sounddevice, "RawInputStream", LiveStream), \
+         patch.object(babel, "coreaudio_devices",
+                      side_effect=[{41: "Wireless Microphone", 42: "Aggregate Device"},
+                                   {42: "Aggregate Device"}]), \
+         patch.object(babel, "coreaudio_subdevices", return_value={41}):
         try:
-            await babel.run(make_args(temp_dir, None))
+            await asyncio.wait_for(babel.run(args), 2)
         except SystemExit as e:
-            assert "simulated device disconnect" in str(e), e
+            assert "audio input device or subdevice disconnected" in str(e), e
         else:
             raise AssertionError("audio failure did not exit")
 
