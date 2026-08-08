@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import os
 import signal
 import tempfile
@@ -351,6 +352,26 @@ async def audio_mixer_check(temp_dir):
     assert restarts == [True, True]
     assert mixer.panel_seen
 
+    class FakeRouter:
+        def __init__(self):
+            self.calls = []
+
+        def enable(self, speaker, blackhole):
+            self.calls.append(("enable", speaker, blackhole))
+
+        def disable(self):
+            self.calls.append(("disable",))
+
+    router = FakeRouter()
+    mixer.output_router = router
+    with patch.object(babel, "discover_audio_devices", return_value=present):
+        await mixer.apply("Wireless Microphone", True, "MacBook Pro Speakers")
+        await mixer.apply("Wireless Microphone", False, "MacBook Pro Speakers")
+    assert router.calls == [
+        ("enable", "MacBook Pro Speakers", "BlackHole 2ch"),
+        ("disable",),
+    ], router.calls
+
     mixer.capture_system = True
     mixer.system_stream = object()
     pack = lambda value: array.array("h", [value]).tobytes()
@@ -366,6 +387,66 @@ async def audio_mixer_check(temp_dir):
     mixer._receive_system(pack(200))
     mixer._receive_mic(pack(1000))
     assert queue.empty() and mixer.system_chunks == []
+
+
+def output_router_check():
+    description = babel.multi_output_description("speaker-uid", "blackhole-uid")
+    assert description["master"] == "speaker-uid"
+    assert description["stacked"] is True
+    assert description["subdevices"] == [
+        {"uid": "speaker-uid", "drift": False},
+        {"uid": "blackhole-uid", "drift": True},
+    ]
+
+    state = {"default": 3}
+    devices = {1: "MacBook Pro Speakers", 2: "BlackHole 2ch",
+               3: "Original Output", 9: "mBabel Multi-Output"}
+
+    def set_default(device_id):
+        state["default"] = device_id
+
+    with patch.object(babel, "coreaudio_devices", return_value=devices), \
+         patch.object(babel, "coreaudio_device_channels", return_value=2), \
+         patch.object(babel, "coreaudio_default_device",
+                      side_effect=lambda _selector: state["default"]), \
+         patch.object(babel, "coreaudio_string_property", return_value=None), \
+         patch.object(babel, "coreaudio_create_multi_output", return_value=9), \
+         patch.object(babel, "coreaudio_set_default_output", side_effect=set_default):
+        router = babel.CoreAudioOutputRouter()
+        router.enable("MacBook Pro Speakers", "BlackHole 2ch")
+        assert state["default"] == 9
+        router.disable()
+        assert state["default"] == 3
+
+        router.enable("MacBook Pro Speakers", "BlackHole 2ch")
+        state["default"] = 1  # explicit user change: do not overwrite it on exit
+        router.disable()
+        assert state["default"] == 1
+
+        state["default"] = 9
+        with patch.object(babel, "coreaudio_string_property",
+                          return_value="com.mbabel.multi-output.stale"):
+            router.enable("MacBook Pro Speakers", "BlackHole 2ch")
+        router.disable()
+        assert state["default"] == 1  # recover from a prior SIGKILL route
+
+
+def audio_config_migration_check(temp_dir):
+    # explicit legacy path: the default points at the real repo checkout,
+    # which must not leak machine state into this check
+    legacy = os.path.join(temp_dir, "legacy", "audio_config.json")
+    target = os.path.join(temp_dir, "home", ".mbabel", "audio_config.json")
+    os.makedirs(os.path.dirname(legacy), exist_ok=True)
+    with open(legacy, "w", encoding="utf-8") as f:
+        f.write('{"speaker":"MacBook Pro Speakers"}')
+    babel.migrate_audio_config(target, legacy)
+    with open(target, encoding="utf-8") as f:
+        assert json.load(f)["speaker"] == "MacBook Pro Speakers"
+    with open(legacy, "w", encoding="utf-8") as f:
+        f.write('{"speaker":"Other Device"}')
+    babel.migrate_audio_config(target, legacy)
+    with open(target, encoding="utf-8") as f:
+        assert json.load(f)["speaker"] == "MacBook Pro Speakers"  # one-shot copy
 
 
 async def draft_reset_check(temp_dir):
@@ -511,6 +592,8 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(signal_check(temp_dir))
         asyncio.run(audio_failure_check(temp_dir))
         asyncio.run(wav_failure_check(temp_dir))
+        output_router_check()
+        audio_config_migration_check(temp_dir)
         asyncio.run(audio_mixer_check(temp_dir))
         asyncio.run(draft_reset_check(temp_dir))
         asyncio.run(draft_promotion_check(temp_dir))

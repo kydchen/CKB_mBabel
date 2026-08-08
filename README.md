@@ -17,7 +17,7 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 - **Speaker labels**: server-side speaker clustering; names sit in the script margin, and the names you assign at export time update the page live.
 - **Domain adaptation without training**: ASR hotwords (direct + boosting table), a client-side corrections map for systematic mishearings, and a translation glossary enforced per sentence.
 - **Live corrections (host only)**: fix a recurring mishearing mid-meeting from the Lab panel (`错词=正确词`); applies to all following sentences instantly and persists to the glossary on exit.
-- **Meeting-style device controls (host only)**: pick or hot-switch the microphone in the browser, optionally mix in BlackHole system audio, and automatically fall back to the default mic if the selected device disappears. No Aggregate Device or channel-count setup.
+- **Meeting-style device controls (host only)**: pick or hot-switch the microphone and listening output in the browser, optionally mix in BlackHole system audio, and automatically fall back if a selected device disappears. mBabel builds the Multi-Output route for online meetings and restores the previous system output on exit.
 - **Viewer preferences**: per-browser language view (bilingual / Chinese only / English only), four font sizes including a full-screen presentation mode; captions auto-follow only while you are at the bottom, with a "back to latest" button after scrolling up.
 - **Shareable, read-only for viewers**: LAN link out of the box; a public `trycloudflare.com` link is one flag away (no account needed). Pipeline controls require a host token that is never sent to LAN or tunneled viewers.
 - **Export**: Markdown or timestamped SRT — original, translation, or bilingual — with speaker names you type once and the browser remembers.
@@ -74,10 +74,8 @@ Optional macOS app: double-click `install-app.command` once. It builds a local
 ### 3. Audio routing (macOS)
 
 - In-person meetings: nothing to do, the MacBook mic works.
-- Online meetings (Zoom/Teams/Meet): install BlackHole (`brew install blackhole-2ch`), then in Audio MIDI Setup:
-  - create a **Multi-Output Device** with your speakers + BlackHole 2ch (you hear the meeting, Babel gets a copy);
-  - do not create an Aggregate Device: Babel opens the microphone and BlackHole separately and mixes them in software.
-- Set the meeting app's output to the Multi-Output Device.
+- Online meetings (Zoom/Teams/Meet): install BlackHole (`brew install blackhole-2ch`). In mBabel's audio panel, choose your listening output and enable **Capture meeting audio**.
+- Keep the meeting app's speaker output on **System Default**. mBabel creates or reuses its own Multi-Output route while capture is enabled and restores the previous system output when capture is disabled or the app exits. No Audio MIDI Setup is required.
 
 ### 4. Run
 
@@ -95,7 +93,7 @@ A browser window opens with the caption page. Useful flags:
 - `--wav test.wav` — replay a 16kHz mono WAV instead of the mic (a sample is included).
 - `--no-ui` — terminal-only output.
 
-Double-click `mBabel.app` (after the optional install above) or `Babel.command`. The host-only microphone chip opens the device panel; settings persist locally in `solution/audio_config.json` (gitignored).
+Double-click `mBabel.app` (after the optional install above) or `Babel.command`. The host-only microphone chip opens the device panel; settings persist outside the synced repository in `~/.mbabel/audio_config.json`.
 
 ## Domain adaptation
 

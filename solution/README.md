@@ -51,8 +51,7 @@ Credentials (`../.env`), `glossary.json`, and `../hotwords/*.txt` all load autom
 One-time audio setup for online meetings (Zoom / Teams / Google Meet / 腾讯会议):
 
 1. Install BlackHole 2ch (`brew install blackhole-2ch`).
-2. Create a **Multi-Output Device (多输出设备)** with your speakers/headphones and BlackHole 2ch checked, speakers first as the clock source. Set the meeting app's speaker output to this device.
-3. Do **not** create an Aggregate Device. Babel opens the selected microphone and BlackHole as independent streams, downmixes each at its real channel count, and mixes them in Python.
+2. Keep the meeting app's speaker output on **System Default**. In mBabel's audio panel, choose your listening output and enable **Capture meeting audio**. mBabel creates the Multi-Output route and restores the previous system output on exit.
 
 For every meeting:
 
@@ -61,7 +60,7 @@ cd CKBA/Babel/solution
 .venv/bin/python main.py
 ```
 
-On startup a browser window opens with the caption UI. The host-only microphone chip opens the device panel: choose a mic and enable “Capture meeting audio” for BlackHole. The choice persists in gitignored `audio_config.json`; a missing mic falls back to the system default without reconnecting ASR. If BlackHole is absent, in-person mic capture still works and the switch shows the install command. Stop with Ctrl+C.
+On startup a browser window opens with the caption UI. The host-only microphone chip opens the device panel: choose a mic and enable “Capture meeting audio” for BlackHole. The choice persists in `~/.mbabel/audio_config.json`; a missing mic falls back to the system default without reconnecting ASR. If BlackHole is absent, in-person mic capture still works and the switch shows the install command. Stop with Ctrl+C.
 
 Test wav must be 16kHz mono 16-bit in a WAV container; convert with:
 

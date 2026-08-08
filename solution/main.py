@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import difflib
+import hashlib
 import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import sys
 import time
@@ -42,6 +44,19 @@ def load_dotenv(path: str) -> None:
             continue
         key, value = line.split("=", 1)
         os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+
+def migrate_audio_config(config_path: str, legacy: str | None = None) -> None:
+    """Copy the old repo-local settings once; OneDrive must not own device state."""
+    if legacy is None:
+        legacy = os.path.join(os.path.dirname(__file__), "audio_config.json")
+    if os.path.exists(config_path) or not os.path.exists(legacy):
+        return
+    try:
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        shutil.copy2(legacy, config_path)
+    except OSError as e:
+        print(f"[audio] cannot migrate device settings: {e}", file=sys.stderr)
 
 
 def load_hotwords_dir(path: str) -> list[tuple[str, int]]:
@@ -268,8 +283,7 @@ def mix_pcm_s16(microphone: bytes, system: bytes) -> bytes:
 _COREAUDIO = None
 
 
-def coreaudio_devices() -> dict[int, str] | None:
-    """Return live macOS CoreAudio device IDs and names; None if unavailable."""
+def _coreaudio_api():
     if sys.platform != "darwin":
         return None
 
@@ -298,14 +312,52 @@ def coreaudio_devices() -> dict[int, str] | None:
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
         ]
         ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+        ca.AudioObjectSetPropertyData.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(Address), ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+        ]
+        ca.AudioObjectSetPropertyData.restype = ctypes.c_int32
+        ca.AudioHardwareCreateAggregateDevice.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+        ]
+        ca.AudioHardwareCreateAggregateDevice.restype = ctypes.c_int32
         cf.CFStringGetCString.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
         ]
         cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringCreateWithCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+        ]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFNumberCreate.argtypes = [
+            ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p,
+        ]
+        cf.CFNumberCreate.restype = ctypes.c_void_p
+        cf.CFArrayCreate.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
+            ctypes.c_void_p,
+        ]
+        cf.CFArrayCreate.restype = ctypes.c_void_p
+        cf.CFDictionaryCreate.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
+            ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        cf.CFDictionaryCreate.restype = ctypes.c_void_p
         cf.CFRelease.argtypes = [ctypes.c_void_p]
         _COREAUDIO = ca, cf, Address
+    return _COREAUDIO
 
-    ca, cf, Address = _COREAUDIO
+
+def coreaudio_devices() -> dict[int, str] | None:
+    """Return live macOS CoreAudio device IDs and names; None if unavailable."""
+    api = _coreaudio_api()
+    if api is None:
+        return None
+
+    import ctypes
+
+    ca, cf, Address = api
     fourcc = lambda value: int.from_bytes(value.encode(), "big")
     device_list = Address(fourcc("dev#"), fourcc("glob"), 0)
     size = ctypes.c_uint32()
@@ -338,14 +390,42 @@ def coreaudio_devices() -> dict[int, str] | None:
     return devices
 
 
+def coreaudio_string_property(device_id: int, selector: str) -> str | None:
+    """Read a CFString-valued device property."""
+    api = _coreaudio_api()
+    if api is None:
+        return None
+
+    import ctypes
+
+    ca, cf, Address = api
+    fourcc = lambda value: int.from_bytes(value.encode(), "big")
+    address = Address(fourcc(selector), fourcc("glob"), 0)
+    value = ctypes.c_void_p()
+    size = ctypes.c_uint32(ctypes.sizeof(value))
+    if ca.AudioObjectGetPropertyData(
+        device_id, ctypes.byref(address), 0, None,
+        ctypes.byref(size), ctypes.byref(value),
+    ) or not value:
+        return None
+    try:
+        text = ctypes.create_string_buffer(1024)
+        if cf.CFStringGetCString(value, text, len(text), 0x08000100):
+            return text.value.decode()
+    finally:
+        cf.CFRelease(value)
+    return None
+
+
 def coreaudio_device_channels(device_id: int, scope: str) -> int:
     """Read the live channel count from a CoreAudio AudioBufferList."""
-    if _COREAUDIO is None:
+    api = _coreaudio_api()
+    if api is None:
         return 0
 
     import ctypes
 
-    ca, _, Address = _COREAUDIO
+    ca, _, Address = api
     fourcc = lambda value: int.from_bytes(value.encode(), "big")
     address = Address(fourcc("slay"), fourcc(scope), 0)
     size = ctypes.c_uint32()
@@ -373,12 +453,13 @@ def coreaudio_device_channels(device_id: int, scope: str) -> int:
 
 
 def coreaudio_default_device(selector: str) -> int | None:
-    if _COREAUDIO is None:
+    api = _coreaudio_api()
+    if api is None:
         return None
 
     import ctypes
 
-    ca, _, Address = _COREAUDIO
+    ca, _, Address = api
     fourcc = lambda value: int.from_bytes(value.encode(), "big")
     address = Address(fourcc(selector), fourcc("glob"), 0)
     size = ctypes.c_uint32(4)
@@ -388,6 +469,164 @@ def coreaudio_default_device(selector: str) -> int | None:
     ):
         return None
     return int(value.value)
+
+
+def coreaudio_set_default_output(device_id: int) -> None:
+    """Set the macOS default (non-alert) output device."""
+    api = _coreaudio_api()
+    if api is None:
+        raise RuntimeError("automatic output routing requires macOS")
+
+    import ctypes
+
+    ca, _, Address = api
+    fourcc = lambda value: int.from_bytes(value.encode(), "big")
+    address = Address(fourcc("dOut"), fourcc("glob"), 0)
+    value = ctypes.c_uint32(device_id)
+    status = ca.AudioObjectSetPropertyData(
+        1, ctypes.byref(address), 0, None,
+        ctypes.sizeof(value), ctypes.byref(value),
+    )
+    if status:
+        raise OSError(status, "CoreAudio could not change the default output")
+
+
+def multi_output_description(speaker_uid: str, blackhole_uid: str) -> dict:
+    """Build the CoreAudio aggregate description for a Multi-Output device."""
+    digest = hashlib.sha256(f"{speaker_uid}\0{blackhole_uid}".encode()).hexdigest()[:16]
+    return {
+        "uid": f"com.mbabel.multi-output.{digest}",
+        "name": "mBabel Multi-Output",
+        "subdevices": [
+            {"uid": speaker_uid, "drift": False},
+            {"uid": blackhole_uid, "drift": True},
+        ],
+        "master": speaker_uid,
+        "private": False,
+        # StackedOutput is CoreAudio's Multi-Output layout: every sub-device
+        # receives the same output channels instead of exposing their sum.
+        "stacked": True,
+    }
+
+
+def coreaudio_create_multi_output(speaker_id: int, blackhole_id: int) -> int:
+    """Create or reuse mBabel's published Multi-Output device."""
+    api = _coreaudio_api()
+    devices = coreaudio_devices()
+    if api is None or devices is None:
+        raise RuntimeError("automatic output routing requires macOS")
+
+    import ctypes
+
+    ca, cf, _ = api
+    speaker_uid = coreaudio_string_property(speaker_id, "uid ")
+    blackhole_uid = coreaudio_string_property(blackhole_id, "uid ")
+    if not speaker_uid or not blackhole_uid:
+        raise RuntimeError("CoreAudio device UID is unavailable")
+    description = multi_output_description(speaker_uid, blackhole_uid)
+    for device_id in devices:
+        if coreaudio_string_property(device_id, "uid ") == description["uid"]:
+            return device_id
+
+    key_callbacks = ctypes.addressof(
+        ctypes.c_byte.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
+    )
+    value_callbacks = ctypes.addressof(
+        ctypes.c_byte.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
+    )
+    array_callbacks = ctypes.addressof(
+        ctypes.c_byte.in_dll(cf, "kCFTypeArrayCallBacks")
+    )
+
+    def make_cf(value):
+        if isinstance(value, str):
+            ref = cf.CFStringCreateWithCString(None, value.encode(), 0x08000100)
+            if not ref:
+                raise MemoryError("cannot create CoreFoundation string")
+            return ref, True
+        if isinstance(value, bool):
+            number = ctypes.c_int32(int(value))
+            ref = cf.CFNumberCreate(None, 3, ctypes.byref(number))  # SInt32
+            if not ref:
+                raise MemoryError("cannot create CoreFoundation number")
+            return ref, True
+        if isinstance(value, list):
+            children = [make_cf(item) for item in value]
+            refs = (ctypes.c_void_p * len(children))(*(item[0] for item in children))
+            ref = cf.CFArrayCreate(None, refs, len(children), array_callbacks)
+        elif isinstance(value, dict):
+            pairs = [(make_cf(str(key)), make_cf(item)) for key, item in value.items()]
+            keys = (ctypes.c_void_p * len(pairs))(*(pair[0][0] for pair in pairs))
+            values = (ctypes.c_void_p * len(pairs))(*(pair[1][0] for pair in pairs))
+            ref = cf.CFDictionaryCreate(
+                None, keys, values, len(pairs), key_callbacks, value_callbacks,
+            )
+            children = [child for pair in pairs for child in pair]
+        else:
+            raise TypeError(f"unsupported CoreFoundation value: {type(value)}")
+        for child, owned in children:
+            if owned:
+                cf.CFRelease(child)
+        if not ref:
+            raise MemoryError("cannot create CoreFoundation container")
+        return ref, True
+
+    root, _ = make_cf(description)
+    device_id = ctypes.c_uint32()
+    try:
+        status = ca.AudioHardwareCreateAggregateDevice(root, ctypes.byref(device_id))
+    finally:
+        cf.CFRelease(root)
+    if status:
+        raise OSError(status, "CoreAudio could not create Multi-Output device")
+    return int(device_id.value)
+
+
+class CoreAudioOutputRouter:
+    """Temporarily route default output to speaker + BlackHole, then restore."""
+
+    def __init__(self):
+        self.original_device = None
+        self.route_device = None
+        self.fallback_device = None
+
+    @staticmethod
+    def _output_id(name: str) -> int | None:
+        devices = coreaudio_devices() or {}
+        return next((device_id for device_id, device_name in devices.items()
+                     if device_name == name
+                     and coreaudio_device_channels(device_id, "outp") > 0), None)
+
+    def enable(self, speaker: str, blackhole: str) -> None:
+        speaker_id = self._output_id(speaker)
+        blackhole_id = self._output_id(blackhole)
+        if speaker_id is None or blackhole_id is None:
+            raise RuntimeError("selected output or BlackHole is unavailable")
+        if self.route_device is None:
+            current = coreaudio_default_device("dOut")
+            current_uid = (coreaudio_string_property(current, "uid ")
+                           if current is not None else None)
+            # Recover from a prior SIGKILL: its finally could not restore the
+            # output, so the stale mBabel route must not become the new target.
+            stale = current_uid and current_uid.startswith("com.mbabel.multi-output.")
+            self.original_device = speaker_id if stale else current
+        route = coreaudio_create_multi_output(speaker_id, blackhole_id)
+        coreaudio_set_default_output(route)
+        self.route_device = route
+        self.fallback_device = speaker_id
+
+    def disable(self) -> None:
+        if self.route_device is None:
+            return
+        current = coreaudio_default_device("dOut")
+        devices = coreaudio_devices() or {}
+        target = (self.original_device if self.original_device in devices
+                  else self.fallback_device if self.fallback_device in devices
+                  else None)
+        # Respect a manual output change made while mBabel was running.
+        if current == self.route_device and target is not None:
+            coreaudio_set_default_output(target)
+        self.original_device = self.route_device = self.fallback_device = None
 
 
 def discover_audio_devices() -> dict:
@@ -447,6 +686,7 @@ class AudioMixer:
         self.paused = False
         self.on_state = None
         self.lock = asyncio.Lock()
+        self.output_router = CoreAudioOutputRouter() if sys.platform == "darwin" else None
         self.stats = {"system_underflow": 0, "system_drop": 0, "queue_drop": 0}
         self.last_scan = time.monotonic()
         self.last_stats = time.monotonic()
@@ -483,6 +723,9 @@ class AudioMixer:
         }
         tmp = self.config_path + ".tmp"
         try:
+            parent = os.path.dirname(self.config_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.config_path)
@@ -502,11 +745,27 @@ class AudioMixer:
         speaker = default_output if default_output in outputs else next(iter(outputs), None)
         return microphone, speaker
 
+    def _sync_output_route(self, enabled: bool | None = None) -> None:
+        if self.output_router is None:
+            return
+        try:
+            active = self.capture_system if enabled is None else enabled
+            if active and self.speaker and self.discovery["blackhole"]:
+                self.output_router.enable(self.speaker, self.discovery["blackhole"])
+                if self.warning.startswith("Automatic output routing failed"):
+                    self.warning = ""
+            else:
+                self.output_router.disable()
+        except Exception as e:
+            self.warning = f"Automatic output routing failed: {e}"
+            print(f"[audio] {self.warning}", file=sys.stderr)
+
     async def scan(self, initial: bool = False, notify: bool = True) -> None:
         self.discovery = discover_audio_devices()
         fallback_mic, fallback_speaker = self._fallbacks()
         restart = False
         changed = False
+        route_changed = False
         if self.microphone not in self.discovery["microphones"]:
             old = self.microphone
             self.microphone = fallback_mic
@@ -517,12 +776,19 @@ class AudioMixer:
                 print(f"[audio] {self.warning}", file=sys.stderr)
         if self.speaker not in self.discovery["outputs"]:
             if self.speaker != fallback_speaker:
+                old = self.speaker
                 self.speaker = fallback_speaker
                 changed = True
+                route_changed = True
+                if old:
+                    self.warning = (f"Listening output disappeared: {old}; "
+                                    f"switched to {fallback_speaker or 'none'}")
+                    print(f"[audio] {self.warning}", file=sys.stderr)
         if self.capture_system and not self.discovery["blackhole"]:
             self.capture_system = False
             restart = not initial
             changed = True
+            route_changed = True
             self.warning = "BlackHole disappeared; system-audio capture was turned off"
             print(f"[audio] {self.warning}", file=sys.stderr)
         if not self.microphone:
@@ -531,6 +797,8 @@ class AudioMixer:
             self.persist()
         if restart:
             await self.restart_streams(refresh=True)
+        if route_changed and not initial:
+            self._sync_output_route()
         if notify:
             await self.notify()
 
@@ -538,6 +806,7 @@ class AudioMixer:
                     speaker: str | None) -> None:
         await self.scan(notify=False)
         restart = False
+        route_changed = False
         if microphone in self.discovery["microphones"] and microphone != self.microphone:
             self.microphone = microphone
             restart = True
@@ -545,8 +814,10 @@ class AudioMixer:
         if requested_system != self.capture_system:
             self.capture_system = requested_system
             restart = True
-        if speaker in self.discovery["outputs"]:
+            route_changed = True
+        if speaker in self.discovery["outputs"] and speaker != self.speaker:
             self.speaker = speaker
+            route_changed = True
         self.panel_seen = True
         self.warning = ("BlackHole 2ch is not installed"
                         if capture_system and not self.discovery["blackhole"] else "")
@@ -563,6 +834,8 @@ class AudioMixer:
                 self.warning = f"Cannot open {failed}; switched to {fallback}: {e}"
                 self.persist()
                 await self.restart_streams(refresh=True)
+        if route_changed:
+            self._sync_output_route()
         await self.notify()
 
     async def mark_seen(self) -> None:
@@ -687,6 +960,7 @@ class AudioMixer:
         try:
             await self.scan(initial=True)
             await self.restart_streams(refresh=False)
+            self._sync_output_route()
             await self.notify()
             while True:
                 await asyncio.sleep(0.5)
@@ -707,6 +981,7 @@ class AudioMixer:
                     print(f"[audio] mixer counters: {self.stats}")
                     self.last_stats = now
         finally:
+            self._sync_output_route(enabled=False)
             self._close_streams()
 
 
@@ -1532,6 +1807,7 @@ async def run(args) -> None:
 
 
 def main() -> None:
+    audio_config = os.path.join(os.path.expanduser("~"), ".mbabel", "audio_config.json")
     parser = argparse.ArgumentParser(description="Live bilingual meeting captions")
     parser.add_argument("--wav", help="test with a 16kHz mono s16le wav file instead of the mic")
     parser.add_argument("--glossary", default=os.path.join(os.path.dirname(__file__), "glossary.json"))
@@ -1549,7 +1825,7 @@ def main() -> None:
     parser.add_argument("--list-devices", action="store_true",
                         help="list audio input devices and exit")
     parser.add_argument("--audio-config",
-                        default=os.path.join(os.path.dirname(__file__), "audio_config.json"),
+                        default=audio_config,
                         help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, default=8765,
                         help="caption UI port (default 8765); pick another to run "
@@ -1565,6 +1841,8 @@ def main() -> None:
 
         print(sd.query_devices())
         return
+    if args.audio_config == audio_config:
+        migrate_audio_config(audio_config)
     load_dotenv(args.env)
     asyncio.run(run(args))
 
