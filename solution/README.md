@@ -26,7 +26,7 @@ ARK_API_KEY=...
 ARK_MODEL=doubao-seed-2-0-lite-260215
 ```
 
-Verified end-to-end on 2026-08-08. Translation is three-stage since W1: volc-mt drafts (whole QPM budget, 0.5s debounce) -> the last draft is promoted as the provisional caption at commit (italic ≈) -> an ark refined pass with the previous two sentences as context replaces it in place (falls back to volc-mt without ark credentials).
+Verified end-to-end on 2026-08-08. Translation is three-stage since W1: volc-mt drafts (whole QPM budget, 0.5s debounce) -> a draft covering at least 60% of the final source is promoted as the provisional caption at commit (italic ≈) -> an ark refined pass with the previous two sentences as context replaces it in place (falls back to volc-mt without ark credentials).
 
 3. Install (use a venv):
 
@@ -126,7 +126,7 @@ Double-click `../Babel.command` in Finder (right-click → Open the first time).
 Root cause of the translation failures: volc-mt enforces a per-ACCOUNT QPM quota (misreported as HTTP 500, body code 55000000 "quota exceeded for types: qpm", effective ~55/min sustained). Dual-key pooling was disproven empirically (quota is per account). Current split:
 
 - Drafts stay on volc-mt (fast, lite identity glossary), cadence 0.6s with a <6-char-in-2s skip threshold; QPM budget is basically all theirs. 2.5s back-off while rate-limited.
-- On commit, the sentence's last draft is promoted immediately as the provisional translation (≈-marked, italic) — the line is readable at once, no "translating…" gap.
+- On commit, the sentence's last draft is promoted immediately only when its source snapshot covers at least 60% of the final sentence. Shorter drafts yield to the refined pass instead of showing a misleading fragment.
 - The refined pass runs on the ark model with the previous two sentences as context (glossary in system prompt); it replaces the provisional in place. The old separate "context polish" fourth pass is gone — context is the default. volc-mt remains the fallback engine when ark credentials are absent.
 - Backfills (every 15s, up to ~3 min) use the same ark engine. RateLimitError is classified separately with 5s/15s retry waits.
 - Lab modal shows 60s request counts per channel (draft/refined/rate-limited). Draft promotion removed the old polish toggle.

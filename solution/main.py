@@ -1003,7 +1003,7 @@ async def run(args) -> None:
     # request counters for the Lab stats line (60s sliding window per channel)
     req_stats = {"volc_draft": deque(), "volc_refined": deque(), "ark": deque(),
                  "ratelimit": deque()}
-    last_draft_result = {"text": "", "src": "", "time": 0.0}
+    last_draft_result = {"text": "", "source": "", "src": "", "time": 0.0}
 
     async def draft_translate(text: str, seq: int) -> None:
         """Translate the still-growing sentence for a live draft. Any draft
@@ -1017,7 +1017,9 @@ async def run(args) -> None:
                 translated = await translator.translate(text, src, tgt, lite=True)
         except Exception:
             return
-        last_draft_result.update(text=translated, src=src, time=time.time())
+        last_draft_result.update(
+            text=translated, source=text, src=src, time=time.time()
+        )
         if ui and seq > last_draft_emit["seq"]:
             last_draft_emit["seq"] = seq
             await ui.emit({"type": "draft", "text": translated, "lang": src})
@@ -1032,12 +1034,13 @@ async def run(args) -> None:
                            "source": text, "speaker": speaker, "ts": ts,
                            "misrec": misrec})
 
-        # W1 draft promotion: the last draft of THIS sentence becomes the
-        # provisional translation the moment the sentence commits — the line
-        # is immediately readable, marked ≈, replaced by the refined pass.
+        # W1 draft promotion: a sufficiently complete draft of THIS sentence
+        # becomes the ≈ provisional translation until the refined pass lands.
         provisional = None
-        ld = draft_snap or {"text": "", "src": "", "time": 0.0}
-        if ld["text"] and ld["src"] == src and time.time() - ld["time"] < 3.0:
+        ld = draft_snap or {"text": "", "source": "", "src": "", "time": 0.0}
+        if (ld["text"] and ld["src"] == src
+                and time.time() - ld["time"] < 3.0
+                and len(ld.get("source", "")) / len(text) >= 0.6):
             provisional = ld["text"]
             if ui:
                 await ui.emit({"type": "translation", "id": seg_id,
@@ -1136,7 +1139,7 @@ async def run(args) -> None:
         # a short next sentence committing within 3s must never promote the
         # previous sentence's draft as its own provisional translation
         draft_snap = dict(last_draft_result)
-        last_draft_result.update(text="", src="", time=0.0)
+        last_draft_result.update(text="", source="", src="", time=0.0)
         last_draft.update(text="")
         if not text or FILLER_RE.match(text):
             return  # drop pure fillers (嗯/哦/呃…) entirely

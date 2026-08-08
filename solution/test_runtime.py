@@ -68,6 +68,41 @@ class DraftAsr(DummyAsr):
         yield SimpleNamespace(text="", utterances=[], is_last=True)
 
 
+class DraftCoverageAsr(DummyAsr):
+    async def transcribe(self, chunks):
+        yield SimpleNamespace(text="只有开头四字", utterances=[], is_last=False)
+        await asyncio.sleep(0.05)
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "只有开头四字但最终句子增加了很多完全不同的内容。",
+                "start_time": 0,
+                "end_time": 100,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
+            is_last=False,
+        )
+        await asyncio.sleep(0.7)
+        yield SimpleNamespace(
+            text="这段草稿已经覆盖完整句子的绝大部分内容",
+            utterances=[],
+            is_last=False,
+        )
+        await asyncio.sleep(0.05)
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "这段草稿已经覆盖完整句子的绝大部分内容。",
+                "start_time": 101,
+                "end_time": 200,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
+            is_last=True,
+        )
+
+
 class CommittedWithResidualAsr(DummyAsr):
     async def transcribe(self, chunks):
         yield SimpleNamespace(
@@ -273,6 +308,19 @@ async def draft_reset_check(temp_dir):
     assert drafts == ["这是第一句非常非常长的内容", "第二句开头六字"], drafts
 
 
+async def draft_promotion_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    DummyUI.events.clear()
+    with patch.object(babel, "VolcAsrClient", DraftCoverageAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True):
+        await babel.run(args)
+    provisional_ids = [event["id"] for event in DummyUI.events
+                       if event.get("provisional")]
+    assert provisional_ids == [2], provisional_ids
+
+
 async def committed_draft_clear_check(temp_dir):
     args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
     args.no_ui = False
@@ -341,6 +389,7 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(wav_failure_check(temp_dir))
         asyncio.run(audio_mixer_check(temp_dir))
         asyncio.run(draft_reset_check(temp_dir))
+        asyncio.run(draft_promotion_check(temp_dir))
         asyncio.run(committed_draft_clear_check(temp_dir))
         asyncio.run(reconnect_check(temp_dir))
         assert time.monotonic() - started < 5

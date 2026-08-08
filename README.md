@@ -13,7 +13,7 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 ## Features
 
 - **Both directions, one stream**: Chinese speech gets English captions, English speech gets Chinese captions, language detection and code-switching handled per sentence.
-- **Three-stage translation, no waiting**: a rough draft (≈ Quick draft) follows the sentence as it is spoken; the moment the sentence ends the draft is promoted as the provisional caption, then a context-aware refined pass (previous sentences as context — pronouns and ellipsis-heavy Chinese resolved) silently replaces it. You never see a "translating…" placeholder.
+- **Three-stage translation, coverage-aware**: a rough draft (≈ Quick draft) follows the sentence as it is spoken. At commit it is promoted only when its source snapshot covers at least 60% of the final sentence; otherwise the context-aware refined pass lands directly instead of briefly showing a misleading fragment.
 - **Speaker labels**: server-side speaker clustering; names sit in the script margin, and the names you assign at export time update the page live.
 - **Domain adaptation without training**: ASR hotwords (direct + boosting table), a client-side corrections map for systematic mishearings, and a translation glossary enforced per sentence.
 - **Live corrections (host only)**: fix a recurring mishearing mid-meeting from the Lab panel (`错词=正确词`); applies to all following sentences instantly and persists to the glossary on exit.
@@ -30,12 +30,12 @@ selected mic + optional BlackHole → 200ms software mixer (mono s16le)
   → Volcengine Seed-ASR 2.0 (streaming, two-pass, hotwords, speaker info)
   → sentence accumulator (language-boundary split, silence watchdog)
   → live draft: Volcengine MT (matx_translate, native glossary_list)
-  → at commit: draft promoted to the caption, then replaced by a
+  → at commit: sufficiently complete draft promoted, then replaced by a
     context-aware refined pass (Doubao Seed mini on Ark)
   → local web UI (one port: HTTP page + WebSocket events)
 ```
 
-One Volcengine speech-console API key covers ASR and the live drafts; an optional Ark key enables the context-aware refined pass (recommended). Total latency: interim text <1s, a readable caption the instant a sentence closes, refined replacement a couple of seconds later — invisibly.
+One Volcengine speech-console API key covers ASR and the live drafts; an optional Ark key enables the context-aware refined pass (recommended). Total latency: interim text <1s; a draft covering at least 60% is readable the instant a sentence closes, otherwise the refined caption lands a couple of seconds later.
 
 ## Cost
 
