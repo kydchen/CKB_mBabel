@@ -103,10 +103,9 @@
   .trans.fallback { color: var(--ink-3); }
   body.single .orig { display: none; }
 
-  /* live strip: two one-line rows. Height follows the font-size preset but
-     is otherwise constant. Lines are TAIL-ANCHORED: the newest words stay
-     flush with the right edge, older words slide out through the left fade,
-     so the freshest text is never clipped at any width. */
+  /* live strip: hearing (1 line, tail-anchored spot-check) + draft (3
+     lines, top-anchored reading surface). Heights follow the font-size
+     preset but are otherwise constant: the strip never jumps. */
   .live {
     flex: 0 0 auto; border-top: 1px solid var(--hair); background: var(--strip);
     padding: 11px 0 13px;
@@ -114,16 +113,20 @@
   .live .inner {
     max-width: min(56rem, 94vw); margin: 0 auto; padding: 0 24px;
     display: grid; grid-template-columns: 8rem 1fr; gap: 6px 1.4rem;
-    align-items: end;  /* tags sit beside the freshest (bottom) line */
+    align-items: start;  /* tags align with the first line of each box */
   }
   .live .tag {
     text-align: left; font-size: 12.5px; letter-spacing: .14em;
     color: var(--ink-3); text-transform: uppercase; white-space: nowrap;
+    /* optically center the tag against the first text line of its box */
+    padding-top: calc((var(--fs-hear) * 1.45 - 15px) / 2);
   }
-  .live .tag.draft-tag { color: var(--accent); }
-  /* each box holds TWO lines, bottom-anchored: text wraps normally, the
-     newest words live on the last visible line, older lines slide up and
-     out through a short top fade. Fixed height: the strip never jumps. */
+  .live .tag.draft-tag {
+    color: var(--accent);
+    padding-top: calc((var(--fs-draft) * 1.45 - 15px) / 2);
+  }
+  /* default box behavior (hearing): bottom-anchored, newest words on the
+     last visible line, older lines fade out through the top mask. */
   .live .line {
     display: flex; flex-direction: column; justify-content: flex-end;
     overflow: hidden;
@@ -143,6 +146,19 @@
        strip is their only live context — a long sentence must fit */
     height: calc(var(--fs-draft) * 1.45 * 3);
   }
+  .live .drafting {
+    /* the sentence grows from the TOP: stable words never move. Only when
+       a 4th line appears does the box follow the tail, line by line. */
+    justify-content: flex-start;
+    -webkit-mask-image: none; mask-image: none;
+  }
+  .live .drafting.overflow {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 .5em);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 .5em);
+  }
+  /* unsettled tail: words not yet confirmed by the next retranslation —
+     same voice as the ≈ provisional caption, works in both themes */
+  #draft-fresh { color: var(--ink-2); font-style: italic; }
   #drafting.on::after {
     content: '▌'; color: var(--accent); animation: breathe 1.1s infinite;
     font-family: var(--sans); font-size: calc(var(--fs-draft) * .8);
@@ -292,7 +308,7 @@
     <span class="tag">原声 <span class="t-en">hearing</span></span>
     <span class="line hearing"><span id="hearing"></span></span>
     <span class="tag draft-tag">快译 <span class="t-en">draft</span></span>
-    <span class="line drafting"><span id="drafting"></span></span>
+    <span class="line drafting"><span id="drafting"><span id="draft-stable"></span><span id="draft-fresh"></span></span></span>
   </div>
 </div>
 <button id="theme-pill" title="明暗主题 Light / dark">☀︎ ⁄ ☾</button>
@@ -353,8 +369,8 @@
     <div class="device-row" id="speaker-row" style="display:none">
       <label for="speaker-select"><span class="zh">你听声音的设备</span><span class="en">Your listening output</span></label>
       <select id="speaker-select"></select>
-      <p class="device-help zh">Phase 1 仍需在“音频 MIDI 设置”中把这个输出与 BlackHole 组成多输出设备，并让会议软件使用它。</p>
-      <p class="device-help en">Phase 1 still requires a Multi-Output Device containing this output and BlackHole; select it in the meeting app.</p>
+      <p class="device-help zh">会议软件的扬声器保持“系统默认”。</p>
+      <p class="device-help en">Keep the meeting app's speaker output on System Default.</p>
     </div>
   </div>
 </div>
@@ -451,6 +467,39 @@ function fmtTime(ts) {
 }
 function tailTrim(text, max = 240) {  // two-line boxes need a deeper tail buffer
   return text.length > max ? '…' + text.slice(-max) : text;
+}
+
+// Draft stability rendering: words that survived one retranslation cycle are
+// "stable" (full ink, never repainted); the divergent tail is "fresh" (ink-2
+// italic, the same voice as the ≈ provisional caption). The box is
+// top-anchored, so stable words never MOVE either — until a 4th line pushes
+// the sentence up, one whole line at a time (scrollHeight is line-quantized).
+const draftEl = document.getElementById('drafting');
+const draftBoxEl = draftEl.parentElement;
+const draftStableEl = document.getElementById('draft-stable');
+const draftFreshEl = document.getElementById('draft-fresh');
+let draftShown = '';
+function clearDraft() {
+  draftShown = '';
+  draftStableEl.textContent = '';
+  draftFreshEl.textContent = '';
+  draftEl.classList.remove('on');
+  draftBoxEl.classList.remove('overflow');
+  draftBoxEl.scrollTop = 0;
+}
+function renderDraft(text) {
+  let i = 0;
+  const max = Math.min(draftShown.length, text.length);
+  while (i < max && draftShown[i] === text[i]) i++;
+  // never split a latin word or number at the stable/fresh boundary
+  while (i > 0 && i < text.length
+         && /[A-Za-z0-9]/.test(text[i - 1]) && /[A-Za-z0-9]/.test(text[i])) i--;
+  draftStableEl.textContent = text.slice(0, i);
+  draftFreshEl.textContent = text.slice(i);
+  draftShown = text;
+  draftEl.classList.add('on');
+  draftBoxEl.scrollTop = draftBoxEl.scrollHeight;  // no-op until the 4th line
+  draftBoxEl.classList.toggle('overflow', draftBoxEl.scrollTop > 0);
 }
 function currentView() { return document.getElementById('view-sel').value; }
 
@@ -622,17 +671,14 @@ function connect() {
     else if (ev.type === 'draft') {
       const v = currentView();
       if (v !== 'both' && ev.lang && ev.lang !== (v === 'zh' ? 'en' : 'zh')) {
-        drafting.textContent = '';
-        drafting.classList.remove('on');
+        clearDraft();
       } else {
-        drafting.textContent = tailTrim(ev.text);  // same tail behavior as hearing
-        drafting.classList.add('on');
+        renderDraft(ev.text);
       }
     }
     else if (ev.type === 'committed') {
       hearing.textContent = '';
-      drafting.textContent = '';
-      drafting.classList.remove('on');
+      clearDraft();
       if (!seenIds.has(ev.id)) history.push(ev);
       appendSentence(ev);
     }
@@ -652,8 +698,7 @@ function connect() {
       pauseBtn.setAttribute('aria-pressed', ev.paused ? 'true' : 'false');
       if (ev.paused) {
         hearing.textContent = '';
-        drafting.textContent = '';
-        drafting.classList.remove('on');
+        clearDraft();
       }
       setLive(ev.paused ? 'paused' : 'resuming…');
     }
@@ -759,8 +804,9 @@ function onDevices(ev) {
   systemToggle.disabled = !ev.blackhole;
   speakerRow.style.display = systemToggle.checked ? '' : 'none';
   const blackholeNote = document.getElementById('blackhole-note');
+  blackholeNote.style.display = ev.blackhole ? 'none' : '';
   blackholeNote.textContent = ev.blackhole
-    ? 'BlackHole 2ch ready · 已就绪'
+    ? ''
     : '未安装 BlackHole 2ch：brew install blackhole-2ch';
   deviceBtn.textContent = ev.microphone || '无麦克风 No mic';
   deviceBtn.classList.toggle('warning', !!ev.warning);
