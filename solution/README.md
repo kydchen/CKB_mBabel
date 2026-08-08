@@ -92,7 +92,7 @@ Double-click `../Babel.command` in Finder (right-click → Open the first time).
 
 ## Robustness notes (post-audit, 2026-08-07)
 
-- The ASR connection auto-reconnects with capped backoff (2s→10s) on network errors or silent server closes; the audio queue drops the oldest chunks (with warnings) rather than the meeting. A status event in the UI header shows "ASR reconnecting…" and flips back to "connected" on recovery. Errors before the first result (bad key, service not activated, handshake 401/403) exit with a clear message instead of looping.
+- The ASR connection auto-reconnects with capped backoff (2s→10s) on network errors or silent server closes. It retains the newest three seconds of audio and the last uncommitted interim text to complete speech across the break; the re-recognized tail is overlap-merged into that prefix. For ten seconds after recovery, a bounded similarity guard filters replay of the prior committed sentence tail. The UI header shows "ASR reconnecting…" and flips back to "connected" on recovery. Errors before the first result (bad key, service not activated, handshake 401/403) exit with a clear message instead of looping.
 - A failed translation is retried once, then shown as "⚠ 翻译失败 translation unavailable" — a sentence can never sit pending forever; failures are not cached.
 - Every committed line is appended to `transcripts/babel-<timestamp>.jsonl` (via to_thread, so OneDrive stalls never block the loop) and rendered to `.md` on exit, including on Ctrl-C.
 - Browser reconnects replay history idempotently (client dedupes by segment id); history replay uses direct awaited sends, so late joiners work past any history length.
@@ -109,7 +109,7 @@ Double-click `../Babel.command` in Finder (right-click → Open the first time).
 - Lab modal (实验 Lab): disfluency smoothing (DDC) live toggle — restarts the ASR session via the reconnect loop (~2s gap); context polish toggle — an ark model re-translates each committed sentence with the previous two originals as context and updates the line in place if it disagrees (default off; the fast refined pass is untouched).
 - Live correction (会中纠错): `wrong=right` in the Lab modal takes effect immediately and is persisted to `glossary.json` corrections on exit. Localhost-only; remote viewers cannot steer the pipeline.
 - Timestamps: every committed line carries a session-relative `ts` into the UI and the transcript; export offers SRT (.srt) alongside Markdown.
-- Silence flush lowered from 3.0s to 2.0s. On ASR reconnect the audio queue is drained — a few seconds of audio are sacrificed so the new session never re-recognizes already-committed speech.
+- Silence flush lowered from 3.0s to 2.0s. ASR reconnect now keeps the latest fifteen 200ms chunks instead of draining the whole queue and overlap-merges the frozen interim prefix; a time-bounded text guard handles replay of the prior committed sentence.
 
 
 ## UX iteration (2026-08-08, from real-meeting feedback)

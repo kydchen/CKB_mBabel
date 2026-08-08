@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import sys
 import time
 import wave
 import webbrowser
+from collections import deque
 
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
@@ -60,6 +62,58 @@ def load_hotwords_dir(path: str) -> list[str]:
 SAMPLE_RATE = 16000
 CHUNK_MS = 200  # 200ms per packet is optimal for the bidirectional endpoint
 CHUNK_BYTES = SAMPLE_RATE * CHUNK_MS // 1000 * 2  # s16le mono
+RECONNECT_TAIL_CHUNKS = 3000 // CHUNK_MS
+REPLAY_GUARD_SECONDS = 10.0
+REPLAY_GUARD_FRAGMENTS = 5
+
+
+def collect_reconnect_tail(sent_tail, queue: asyncio.Queue,
+                           keep: int = RECONNECT_TAIL_CHUNKS) -> tuple[list, int]:
+    """Collect the newest sent and pending audio for the next ASR session."""
+    chunks = list(sent_tail)
+    while True:
+        try:
+            chunk = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if chunk is not None:
+            chunks.append(chunk)
+    tail = chunks[-keep:]
+    return tail, len(chunks) - len(tail)
+
+
+def is_replay_duplicate(text: str, previous: str) -> bool:
+    """Return whether a reconnect fragment repeats the prior sentence tail."""
+    normalize = lambda value: re.sub(r"[\W_]+", "", value).casefold()
+    candidate = normalize(text)
+    prior = normalize(previous)
+    # Short acknowledgements are too ambiguous: visible duplication is safer
+    # than dropping a legitimate repeated "yes" / "好".
+    if len(candidate) < 4 or not prior or len(candidate) > len(prior):
+        return False
+    tail = prior[-len(candidate):]
+    return difflib.SequenceMatcher(
+        None, candidate, tail, autojunk=False
+    ).ratio() > 0.8
+
+
+def merge_reconnect_partial(partial: str, replay: str) -> str:
+    """Join a pre-disconnect interim with the re-recognized audio tail."""
+    prefix = partial.strip()
+    suffix = replay.strip()
+    if not prefix or not suffix:
+        return prefix or suffix
+    blocks = difflib.SequenceMatcher(
+        None, prefix.casefold(), suffix.casefold(), autojunk=False
+    ).get_matching_blocks()
+    overlaps = [block for block in blocks
+                if block.size >= 4 and block.a + block.size == len(prefix)]
+    if overlaps:
+        overlap = max(overlaps, key=lambda block: block.size)
+        return prefix + suffix[overlap.b + overlap.size:]
+    separator = (" " if prefix[-1].isascii() and prefix[-1].isalnum()
+                 and suffix[0].isascii() and suffix[0].isalnum() else "")
+    return prefix + separator + suffix
 
 def print_safe(*args, **kwargs) -> None:
     """print() that survives a dead pty: closing the terminal window delivers
@@ -913,6 +967,10 @@ async def run(args) -> None:
     draft_tasks: list[asyncio.Task] = []  # cancelled on flush: finals have priority
     cache: dict[str, str] = {}
     recent_sources: list[str] = []  # last committed originals, context for polish
+    last_committed = {"text": ""}
+    last_live_line = {"text": ""}
+    reconnect_partial = {"text": ""}
+    replay_guard = {"until": 0.0, "remaining": 0, "previous": ""}
     session_t0 = time.time()
     seg_seq = 0
     draft_seq = 0
@@ -933,7 +991,6 @@ async def run(args) -> None:
 
     draft_sem = asyncio.Semaphore(3)  # drafts never starve the refined pass
     fail_stats: dict = {}
-    from collections import deque
     # request counters for the Lab stats line (60s sliding window per channel)
     req_stats = {"volc_draft": deque(), "volc_refined": deque(), "ark": deque(),
                  "ratelimit": deque()}
@@ -1060,6 +1117,7 @@ async def run(args) -> None:
         speaker = line_speaker["id"]
         misrec = line_misrec["v"]
         line_parts.clear()
+        last_live_line["text"] = ""
         line_speaker["id"] = None
         line_misrec["v"] = False
         for task in draft_tasks:  # stale drafts are obsolete once a line commits
@@ -1074,6 +1132,7 @@ async def run(args) -> None:
         if not text or FILLER_RE.match(text):
             return  # drop pure fillers (嗯/哦/呃…) entirely
         seg_seq += 1
+        last_committed["text"] = text
         translate_tasks.append(
             asyncio.create_task(commit(text, seg_seq, speaker, misrec, draft_snap)))
 
@@ -1099,18 +1158,36 @@ async def run(args) -> None:
     reconnects = 0
     ever_connected = False
     announced_connected = True  # flips False while disconnected
+    sent_audio_tail = deque(maxlen=RECONNECT_TAIL_CHUNKS)
+    replay_audio: list[bytes] = []
+
+    async def reconnect_chunks():
+        while replay_audio:
+            chunk = replay_audio.pop(0)
+            sent_audio_tail.append(chunk)
+            yield chunk
+        async for chunk in chunk_iterator(queue):
+            sent_audio_tail.append(chunk)
+            yield chunk
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGHUP):
         loop.add_signal_handler(sig, run_task.cancel)
     try:
         while True:  # ASR reconnect loop: survive network blips mid-meeting
             got_last = False
+            sent_audio_tail.clear()
             try:
-                async for event in asr.transcribe(chunk_iterator(queue)):
+                async for event in asr.transcribe(reconnect_chunks()):
                     if not ever_connected:
                         ever_connected = True
                     if not announced_connected:
                         announced_connected = True
+                        replay_guard.update(
+                            until=loop.time() + REPLAY_GUARD_SECONDS,
+                            remaining=REPLAY_GUARD_FRAGMENTS,
+                            previous=last_committed["text"],
+                        )
                         if ui:
                             await ui.emit({"type": "status", "text": "connected"})
                     if event.text or event.utterances:
@@ -1122,6 +1199,17 @@ async def run(args) -> None:
                         if utt.get("definite") and key not in committed and utt.get("text"):
                             committed.add(key)
                             frag = correct(utt["text"])
+                            if (replay_guard["remaining"] > 0
+                                    and loop.time() < replay_guard["until"]):
+                                replay_guard["remaining"] -= 1
+                                if is_replay_duplicate(frag, replay_guard["previous"]):
+                                    print(f"[asr] skipped replayed fragment after reconnect: {frag}")
+                                    continue
+                            if reconnect_partial["text"]:
+                                frag = merge_reconnect_partial(
+                                    reconnect_partial["text"], frag
+                                )
+                                reconnect_partial["text"] = ""
                             speaker = (utt.get("additions") or {}).get("speaker_id")
                             # a speaker change is a natural turn boundary
                             if (speaker is not None and line_speaker["id"] is not None
@@ -1152,7 +1240,13 @@ async def run(args) -> None:
                     packet_committed = seg_seq != packet_seg_seq
                     if line_parts or (event.text and not packet_committed):
                         live_text = "" if packet_committed else correct(event.text)
-                        line = "".join(line_parts) + live_text
+                        if reconnect_partial["text"] and not line_parts:
+                            line = merge_reconnect_partial(
+                                reconnect_partial["text"], live_text
+                            )
+                        else:
+                            line = "".join(line_parts) + live_text
+                        last_live_line["text"] = line.strip()
                         text = line.strip()
                         now = asyncio.get_running_loop().time()
                         # Draft budget: QPM is per-account and reserved for
@@ -1194,15 +1288,17 @@ async def run(args) -> None:
                 break
             reconnects += 1
             announced_connected = False
-            # drain the audio queue: buffered chunks belong to the dead
-            # session, and sending them to the new one re-recognizes speech
-            # that may already be committed. Lose a few seconds of audio
-            # rather than duplicate captions.
-            while not queue.empty():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            if last_live_line["text"]:
+                reconnect_partial["text"] = last_live_line["text"]
+                line_parts.clear()
+                print(f"[asr] preserved interim across reconnect: "
+                      f"{reconnect_partial['text']}", file=sys.stderr)
+            # Keep the newest three seconds so a network flap does not eat the
+            # sentence crossing the disconnect. The bounded replay guard above
+            # absorbs a near-duplicate of the last sentence if ASR sees it again.
+            replay_audio, dropped = collect_reconnect_tail(sent_audio_tail, queue)
+            print(f"[asr] reconnect audio tail: kept {len(replay_audio)} chunks, "
+                  f"dropped {dropped}", file=sys.stderr)
             committed.clear()
             delay = min(2 * reconnects, 10)
             print(f"[asr] reconnecting in {delay}s (attempt {reconnects})", file=sys.stderr)
@@ -1218,6 +1314,9 @@ async def run(args) -> None:
                            f"audio input failed: {audio_failure['error']}"})
             await asyncio.sleep(0)
     finally:
+        if reconnect_partial["text"] and not line_parts:
+            line_parts.append(reconnect_partial["text"])
+            reconnect_partial["text"] = ""
         await flush_line()  # Ctrl-C must not drop the line still accumulating
         producer.cancel()
         watchdog.cancel()

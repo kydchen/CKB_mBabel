@@ -85,6 +85,61 @@ class CommittedWithResidualAsr(DummyAsr):
         yield SimpleNamespace(text="", utterances=[], is_last=True)
 
 
+class ReconnectingAsr(DummyAsr):
+    sessions = 0
+    received = []
+
+    async def transcribe(self, chunks):
+        type(self).sessions += 1
+        self.received.append(await anext(chunks))
+        if self.sessions == 1:
+            yield SimpleNamespace(
+                text="",
+                utterances=[{
+                    "definite": True,
+                    "text": "前一句已经完整落定。",
+                    "start_time": 0,
+                    "end_time": 100,
+                    "additions": {"speaker_id": "1", "lid_lang": "speech_mand"},
+                }],
+                is_last=False,
+            )
+            yield SimpleNamespace(
+                text="我们这周讨论一下 fiber 网络和 RGB++的进展，还有基于",
+                utterances=[],
+                is_last=False,
+            )
+            await asyncio.sleep(0)
+            raise babel.AsrError(45000081, "test reconnect")
+        yield SimpleNamespace(
+            text="",
+            utterances=[
+                {
+                    "definite": True,
+                    "text": "已经完整落定。",
+                    "start_time": 0,
+                    "end_time": 100,
+                    "additions": {"speaker_id": "1", "lid_lang": "speech_mand"},
+                },
+                {
+                    "definite": True,
+                    "text": "一、加加的进展，还有基于 UTXO 的状态通道设计。",
+                    "start_time": 101,
+                    "end_time": 200,
+                    "additions": {"speaker_id": "1", "lid_lang": "speech_mand"},
+                },
+                {
+                    "definite": True,
+                    "text": "网络恢复后的正常新句子。",
+                    "start_time": 201,
+                    "end_time": 300,
+                    "additions": {"speaker_id": "1", "lid_lang": "speech_mand"},
+                },
+            ],
+            is_last=True,
+        )
+
+
 class DummyUI:
     events = []
 
@@ -231,6 +286,48 @@ async def committed_draft_clear_check(temp_dir):
     assert stale == [], stale
 
 
+async def reconnect_check(temp_dir):
+    queue = asyncio.Queue()
+    for value in range(10, 20):
+        queue.put_nowait(value)
+    tail, dropped = babel.collect_reconnect_tail(range(10), queue)
+    assert dropped == 5
+    assert tail == list(range(5, 20))
+    assert queue.empty()
+    assert babel.is_replay_duplicate("已经完整落定。", "前一句已经完整落定。")
+    assert not babel.is_replay_duplicate("网络恢复后的正常新句子。", "前一句已经完整落定。")
+    assert not babel.is_replay_duplicate("好", "前一句说好")
+    assert babel.merge_reconnect_partial(
+        "我们这周讨论一下 fiber 网络和 RGB++的进展，还有基于",
+        "一、加加的进展，还有基于 UTXO 的状态通道设计。",
+    ) == "我们这周讨论一下 fiber 网络和 RGB++的进展，还有基于 UTXO 的状态通道设计。"
+
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    DummyUI.events.clear()
+    ReconnectingAsr.sessions = 0
+    ReconnectingAsr.received.clear()
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay):
+        await real_sleep(0)
+
+    with patch.object(babel, "VolcAsrClient", ReconnectingAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True), \
+         patch.object(babel.asyncio, "sleep", fast_sleep):
+        await babel.run(args)
+    assert len(ReconnectingAsr.received) == 2
+    assert ReconnectingAsr.received[0] == ReconnectingAsr.received[1]
+    sources = [event["source"] for event in DummyUI.events
+               if event["type"] == "committed"]
+    assert sources == [
+        "前一句已经完整落定。",
+        "我们这周讨论一下 fiber 网络和 RGB++的进展，还有基于 UTXO 的状态通道设计。",
+        "网络恢复后的正常新句子。",
+    ], sources
+
+
 with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
     os.mkdir(os.path.join(temp_dir, "hotwords"))
     babel.__file__ = os.path.join(temp_dir, "main.py")
@@ -245,6 +342,7 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(audio_mixer_check(temp_dir))
         asyncio.run(draft_reset_check(temp_dir))
         asyncio.run(committed_draft_clear_check(temp_dir))
+        asyncio.run(reconnect_check(temp_dir))
         assert time.monotonic() - started < 5
 
-print("runtime: draft reset/clear, SIGTERM save, producer failures, and mixer fallback pass")
+print("runtime: drafts, signals, producer failures, mixer fallback, and reconnect pass")
