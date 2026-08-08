@@ -41,29 +41,27 @@ cd CKBA/Babel/solution
 .venv/bin/python main.py                      # mic input (default device)
 .venv/bin/python main.py --end-window 600     # faster segment commit (min 200)
 .venv/bin/python main.py --wav test.wav       # test with a recording
-.venv/bin/python main.py --list-devices       # show input device indexes
-.venv/bin/python main.py --device 2           # pick an input device (e.g. BlackHole)
+.venv/bin/python main.py --list-devices       # diagnostic device list
 ```
 
 Credentials (`../.env`), `glossary.json`, and `../hotwords/*.txt` all load automatically. Hotword files are merged with the glossary terms and capped at the 100-token streaming limit (a warning prints when truncated).
 
 ## Daily meeting usage
 
-One-time audio setup for online meetings (Zoom / Teams / Google Meet / 腾讯会议). Two different constructs in Audio MIDI Setup (音频 MIDI 设置), for two different purposes:
+One-time audio setup for online meetings (Zoom / Teams / Google Meet / 腾讯会议):
 
-1. **Multi-Output Device (多输出设备)** — so YOU can hear the meeting while Babel gets a copy. Create it with your speakers/headphones and BlackHole 2ch checked, speakers first as the clock source. Set the meeting app's speaker output (or the system output) to this Multi-Output Device. Do NOT use an Aggregate Device for this: an aggregate routes stereo channels 1-2 only to the first subdevice, which is why the speakers went silent.
-2. **Aggregate Device (聚合设备)** — only if your OWN voice must also be captioned. Create it with BlackHole 2ch (remote participants) and your microphone (e.g. Wireless Microphone) checked. It exposes 4 input channels: 1-2 meeting, 3-4 you.
+1. Install BlackHole 2ch (`brew install blackhole-2ch`).
+2. Create a **Multi-Output Device (多输出设备)** with your speakers/headphones and BlackHole 2ch checked, speakers first as the clock source. Set the meeting app's speaker output to this device.
+3. Do **not** create an Aggregate Device. Babel opens the selected microphone and BlackHole as independent streams, downmixes each at its real channel count, and mixes them in Python.
 
 For every meeting:
 
 ```bash
 cd CKBA/Babel/solution
-.venv/bin/python main.py --list-devices                 # find device indexes once
-.venv/bin/python main.py --device <BlackHole idx>       # caption remote voices only
-.venv/bin/python main.py --device <Aggregate idx> --channels 4   # remote + your mic
+.venv/bin/python main.py
 ```
 
-On startup a browser window opens with the two-pane caption UI (originals on top, translations below). For in-person meetings just run `main.py` and let it listen on the MacBook mic. Stop with Ctrl+C.
+On startup a browser window opens with the caption UI. The host-only microphone chip opens the device panel: choose a mic and enable “Capture meeting audio” for BlackHole. The choice persists in gitignored `audio_config.json`; a missing mic falls back to the system default without reconnecting ASR. If BlackHole is absent, in-person mic capture still works and the switch shows the install command. Stop with Ctrl+C.
 
 Test wav must be 16kHz mono 16-bit in a WAV container; convert with:
 
@@ -90,7 +88,7 @@ Hotwords travel in two channels. Direct transmission is capped at 100 tokens, so
 
 ## One-click launch
 
-Double-click `../Babel.command` in Finder (right-click → Open the first time). It cds into this directory and runs `main.py --device "Aggregate" --channels 4 --share`. The device is matched by name substring, so audio-device index drift no longer breaks it.
+Double-click `../Babel.command` in Finder (right-click → Open the first time). It cds into this directory and runs `main.py --share`; microphone and system-audio choices live in the host device panel.
 
 ## Robustness notes (post-audit, 2026-08-07)
 
@@ -100,7 +98,7 @@ Double-click `../Babel.command` in Finder (right-click → Open the first time).
 - Browser reconnects replay history idempotently (client dedupes by segment id); history replay uses direct awaited sends, so late joiners work past any history length.
 - With `--share`, the page is served only under a random token path (LAN and tunnel URLs both include it); slow or stalled viewers get dropped rather than slowing the pipeline. The cloudflared tunnel starts in the background — startup never waits for it, and the public link appears in the Share dialog when ready.
 - Draft translations use a fixed 0.5s debounce and a reduced identity-terms-only glossary (proper nouns), keeping draft cost far below the refined pass without visible lag.
-- `--device` accepts a device name substring (e.g. `--device Aggregate`), immune to index drift.
+- Audio devices refresh every three seconds. A selected microphone disappearing triggers a visible warning and an in-place fallback to the default microphone; the ASR session and buffered captions stay alive.
 - Known limit: no pause button — the ASR server closes sessions after 8s idle, so a real pause needs coordinated sender/reconnect logic (planned).
 
 

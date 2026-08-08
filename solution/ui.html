@@ -55,6 +55,11 @@
     animation: breathe 2.4s ease-in-out infinite;
   }
   #live-dot.off::before { background: var(--ink-3); animation: none; }
+  #device-btn.warning { color: var(--accent); font-weight: 600; }
+  #device-warning {
+    display: none; padding: 7px 28px; background: var(--accent); color: var(--paper);
+    font-size: 13px; line-height: 1.4;
+  }
   @keyframes breathe { 50% { opacity: .35; } }
   body.fs-xl header { display: none; }
   #pres-exit {
@@ -174,6 +179,10 @@
   .modal input[type=radio], .modal input[type=checkbox] { accent-color: var(--accent); }
   .modal label:hover { color: var(--ink); }
   .modal input[type=text]:focus { outline: none; border-color: var(--accent); }
+  .modal select {
+    width: 100%; background: var(--strip); color: var(--ink); border: 1px solid var(--hair);
+    border-radius: 6px; padding: 8px 12px; font-size: 15px;
+  }
   .modal .close:hover { color: var(--ink); }
   .modal p { margin: 6px 0; }
   .modal .en { color: var(--ink-3); font-size: 14px; }
@@ -203,6 +212,9 @@
   }
   .lab-row { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0; }
   .lab-row input[type=checkbox] { width: 18px; height: 18px; flex: none; margin-top: 4px; }
+  .device-row { margin: 13px 0; }
+  .device-row > label { margin-bottom: 4px; color: var(--ink); font-weight: 600; }
+  .device-help { color: var(--ink-3); font-size: 13px; line-height: 1.55; }
   #corr-input { flex: 1; }
 
   /* the centered 56rem strip content approaches the fixed pill when the
@@ -216,6 +228,7 @@
   @media (max-width: 640px) {
     body { --fs-hear: 13px; --fs-draft: 15.5px; }  /* keep the whole tail readable */
     header { padding: 10px 14px 8px; row-gap: 4px; }
+    #device-warning { padding: 7px 14px; }
     /* two clean rows: wordmark … LIVE / one horizontally-scrollable control row */
     #live-dot { margin-left: auto; order: 1; }
     header nav {
@@ -256,6 +269,7 @@
       <option value="l">大 L</option>
       <option value="xl">投屏 XL</option>
     </select>
+    <a id="device-btn" title="声音设备 Audio devices" style="display:none">声音 Audio</a>
     <a id="lab-btn">实验 Lab</a>
     <a id="share-btn" style="display:none">分享 Share</a>
     <a id="info-btn">说明 About</a>
@@ -263,6 +277,7 @@
   </nav>
   <span id="live-dot">LIVE</span>
 </header>
+<div id="device-warning"></div>
 
 <main id="main"><div class="script" id="script"></div></main>
 <button id="follow-btn">↓ 回到最新 latest</button>
@@ -310,6 +325,33 @@
     <div id="share-links"></div>
     <p class="zh" style="color:var(--ink-3);font-size:13px">注意:拿到公网链接的人即拿到会议字幕全文,请只发给与会者。</p>
     <p class="en" style="color:var(--ink-3);font-size:13px">The public link exposes the full transcript. Share only with attendees.</p>
+  </div>
+</div>
+
+<div class="modal-mask" id="device-mask">
+  <div class="modal" data-lang="zh">
+    <span class="close" data-close="device-mask">✕</span>
+    <button class="hbtn lang-flip">EN</button>
+    <h2>声音设备 Audio devices</h2>
+    <div class="device-row">
+      <label for="mic-select"><span class="zh">麦克风</span><span class="en">Microphone</span></label>
+      <select id="mic-select"></select>
+      <p class="device-help"><span class="zh">AirPods 等蓝牙麦克风会让蓝牙切到低音质通话模式,这是蓝牙协议的限制。</span><span class="en">Bluetooth mics (e.g. AirPods) drop the link to low-quality call mode while capturing — a Bluetooth limitation.</span></p>
+    </div>
+    <div class="lab-row">
+      <input type="checkbox" id="system-toggle">
+      <label for="system-toggle" style="margin:0">
+        <span class="zh">采集会议声音（线上会议）</span>
+        <span class="en">Capture meeting audio (online meetings)</span>
+      </label>
+    </div>
+    <p id="blackhole-note" class="device-help"></p>
+    <div class="device-row" id="speaker-row" style="display:none">
+      <label for="speaker-select"><span class="zh">你听声音的设备</span><span class="en">Your listening output</span></label>
+      <select id="speaker-select"></select>
+      <p class="device-help zh">Phase 1 仍需在“音频 MIDI 设置”中把这个输出与 BlackHole 组成多输出设备，并让会议软件使用它。</p>
+      <p class="device-help en">Phase 1 still requires a Multi-Output Device containing this output and BlackHole; select it in the meeting app.</p>
+    </div>
   </div>
 </div>
 
@@ -545,6 +587,7 @@ function renderAll() {
 // ---- websocket ----
 let wsConn = null;
 let controlToken = null;
+let devicePanelOpened = false;
 function wsSend(obj) {
   if (wsConn && wsConn.readyState === 1 && controlToken) {
     wsConn.send(JSON.stringify({...obj, token: controlToken}));
@@ -561,7 +604,12 @@ function connect() {
   const ws = new WebSocket(proto + location.host + location.pathname);
   wsConn = ws;
   ws.onopen = () => setLive('');
-  ws.onclose = () => { setLive('reconnecting…'); setTimeout(connect, 1500); };
+  ws.onclose = () => {
+    controlToken = null;
+    document.getElementById('device-btn').style.display = 'none';
+    setLive('reconnecting…');
+    setTimeout(connect, 1500);
+  };
   ws.onmessage = (m) => {
     const ev = JSON.parse(m.data);
     if (ev.type === 'interim') { hearing.textContent = tailTrim(ev.text); }
@@ -584,7 +632,12 @@ function connect() {
     }
     else if (ev.type === 'translation') addTranslation(ev);
     else if (ev.type === 'share') onShare(ev);
-    else if (ev.type === 'control_token') { controlToken = ev.token; }
+    else if (ev.type === 'control_token') {
+      controlToken = ev.token;
+      document.getElementById('device-btn').style.display = '';
+      wsSend({type: 'devices_get'});
+    }
+    else if (ev.type === 'devices') onDevices(ev);
     else if (ev.type === 'status') {
       setLive(ev.text === 'connected' ? '' : ev.text);
     }
@@ -650,6 +703,61 @@ document.getElementById('share-btn').onclick = () => {
   }
   openModal('share-mask');
 };
+
+// ---- audio devices (host only) ----
+const deviceBtn = document.getElementById('device-btn');
+const micSelect = document.getElementById('mic-select');
+const systemToggle = document.getElementById('system-toggle');
+const speakerSelect = document.getElementById('speaker-select');
+const speakerRow = document.getElementById('speaker-row');
+const deviceWarning = document.getElementById('device-warning');
+
+function fillSelect(select, values, current) {
+  const existing = [...select.options].map(option => option.value);
+  if (existing.length === values.length && existing.every((value, i) => value === values[i])) {
+    select.value = current || '';
+    return;
+  }
+  select.textContent = '';
+  for (const value of values) {
+    const option = document.createElement('option');
+    option.value = option.textContent = value;
+    option.selected = value === current;
+    select.appendChild(option);
+  }
+}
+
+function sendAudioSettings() {
+  speakerRow.style.display = systemToggle.checked ? '' : 'none';
+  wsSend({type: 'audio_settings', microphone: micSelect.value,
+          capture_system: systemToggle.checked, speaker: speakerSelect.value});
+}
+
+function onDevices(ev) {
+  fillSelect(micSelect, ev.microphones || [], ev.microphone);
+  fillSelect(speakerSelect, ev.outputs || [], ev.speaker);
+  systemToggle.checked = !!ev.capture_system;
+  systemToggle.disabled = !ev.blackhole;
+  speakerRow.style.display = systemToggle.checked ? '' : 'none';
+  const blackholeNote = document.getElementById('blackhole-note');
+  blackholeNote.textContent = ev.blackhole
+    ? 'BlackHole 2ch ready · 已就绪'
+    : '未安装 BlackHole 2ch：brew install blackhole-2ch';
+  deviceBtn.textContent = ev.microphone || '无麦克风 No mic';
+  deviceBtn.classList.toggle('warning', !!ev.warning);
+  deviceWarning.textContent = ev.warning || '';
+  deviceWarning.style.display = ev.warning ? 'block' : 'none';
+  if (ev.first_run && !devicePanelOpened) {
+    devicePanelOpened = true;
+    openModal('device-mask');
+    wsSend({type: 'devices_seen'});
+  }
+}
+
+deviceBtn.onclick = () => openModal('device-mask');
+micSelect.onchange = sendAudioSettings;
+systemToggle.onchange = sendAudioSettings;
+speakerSelect.onchange = sendAudioSettings;
 
 // ---- lab ----
 function setLabEnabled(on) {

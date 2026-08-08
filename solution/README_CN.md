@@ -21,18 +21,17 @@
 
 ## 日常使用
 
-线上会议一次性音频配置(macOS 音频 MIDI 设置):**多输出设备**勾扬声器加 BlackHole 2ch(你听得到、程序拿一份);**聚合设备**勾 BlackHole 2ch 加你的麦克风(远端加本地声音都进字幕)。会议软件输出选多输出设备。
+线上会议只需一次性安装 BlackHole 2ch,并在 macOS“音频 MIDI 设置”里建一个**多输出设备**:勾选扬声器/耳机与 BlackHole,扬声器放第一并作为时钟源,会议软件输出选这个多输出设备。不要再建聚合设备:Babel 会独立打开你选的麦克风和 BlackHole,按实际声道数转单声道后在程序内混音。
 
-每次开会:双击 `../Babel.command`(设备序号写死在里面),或手动:
+每次开会双击 `../Babel.command`,或手动:
 
 ```bash
 cd CKBA/Babel/solution
-.venv/bin/python main.py --device <聚合设备序号> --channels 4
-.venv/bin/python main.py --list-devices    # 查序号
+.venv/bin/python main.py
 .venv/bin/python main.py --share           # 打印 LAN 链接;装了 cloudflared 自动出公网链接
 ```
 
-启动后浏览器自动打开字幕页:说明按钮看界面解释,分享按钮复制链接,导出按钮下载 md(原文/译文/双语,说话人可命名且浏览器记忆)。
+启动后浏览器自动打开字幕页。本机主持人顶栏会看到麦克风芯片:可选麦克风、会中热切换,并打开“采集会议声音”让 BlackHole 进入混音;设置保存在 gitignored 的 `audio_config.json`。当前麦克风消失时,3 秒内出现红色警告并自动回落系统默认麦,ASR 会话不断。没装 BlackHole 时线下麦克风照常可用,开关置灰并显示安装命令。
 
 ## 成本(2026-08,以控制台为准)
 
@@ -47,7 +46,7 @@ cd CKBA/Babel/solution
 - 每个确定句自动追加到 `transcripts/babel-<时间戳>.jsonl`(经 to_thread,OneDrive 卡顿不阻塞主循环),退出时渲染同名 .md,Ctrl-C 也会收尾。
 - 浏览器断线重连按句子 id 幂等;历史重放走 await 直发,任意长度的历史都不会把晚加入者卡死。
 - `--share` 下页面挂在随机 token 路径下;cloudflared 隧道后台启动,不阻塞 ASR,公网链接就绪后自动出现在分享弹窗;卡死的观看端会被断开而不拖慢管线。
-- `--device` 支持设备名子串(如 `--device Aggregate`),不再受序号漂移影响。
+- 设备列表每 3 秒刷新;当前麦克风消失时自动切到系统默认麦,不重连 ASR。
 - 草稿翻译固定 0.5 秒防抖,且用只含恒等术语(专名)的精简术语表,成本大幅下降而刷新不变慢。
 - 语言切分正则有回归断言:`python test_split.py`。
 - 已知限制:没有暂停按钮(服务端 8 秒空闲即断连,真暂停需要和重连联动,后续再做)。

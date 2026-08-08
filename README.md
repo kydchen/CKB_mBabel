@@ -17,6 +17,7 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 - **Speaker labels**: server-side speaker clustering; names sit in the script margin, and the names you assign at export time update the page live.
 - **Domain adaptation without training**: ASR hotwords (direct + boosting table), a client-side corrections map for systematic mishearings, and a translation glossary enforced per sentence.
 - **Live corrections (host only)**: fix a recurring mishearing mid-meeting from the Lab panel (`错词=正确词`); applies to all following sentences instantly and persists to the glossary on exit.
+- **Meeting-style device controls (host only)**: pick or hot-switch the microphone in the browser, optionally mix in BlackHole system audio, and automatically fall back to the default mic if the selected device disappears. No Aggregate Device or channel-count setup.
 - **Viewer preferences**: per-browser language view (bilingual / Chinese only / English only), four font sizes including a full-screen presentation mode; captions auto-follow only while you are at the bottom, with a "back to latest" button after scrolling up.
 - **Shareable, read-only for viewers**: LAN link out of the box; a public `trycloudflare.com` link is one flag away (no account needed). Pipeline controls require a host token that is never sent to LAN or tunneled viewers.
 - **Export**: Markdown or timestamped SRT — original, translation, or bilingual — with speaker names you type once and the browser remembers.
@@ -25,7 +26,7 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 ## Architecture
 
 ```
-mic / system audio (BlackHole + Aggregate Device on macOS)
+selected mic + optional BlackHole → 200ms software mixer (mono s16le)
   → Volcengine Seed-ASR 2.0 (streaming, two-pass, hotwords, speaker info)
   → sentence accumulator (language-boundary split, silence watchdog)
   → live draft: Volcengine MT (matx_translate, native glossary_list)
@@ -71,17 +72,14 @@ python3 -m venv .venv
 
 - In-person meetings: nothing to do, the MacBook mic works.
 - Online meetings (Zoom/Teams/Meet): install BlackHole (`brew install blackhole-2ch`), then in Audio MIDI Setup:
-  - a **Multi-Output Device** with your speakers + BlackHole 2ch (you hear the meeting, Babel gets a copy);
-  - an **Aggregate Device** with BlackHole 2ch + your microphone (remote voices + your voice), if your own speech should be captioned too.
+  - create a **Multi-Output Device** with your speakers + BlackHole 2ch (you hear the meeting, Babel gets a copy);
+  - do not create an Aggregate Device: Babel opens the microphone and BlackHole separately and mixes them in software.
 - Set the meeting app's output to the Multi-Output Device.
 
 ### 4. Run
 
 ```bash
 cd solution
-.venv/bin/python main.py --list-devices                       # find device indexes
-.venv/bin/python main.py --device <aggregate idx> --channels 4
-# or simply, for the default mic:
 .venv/bin/python main.py
 ```
 
@@ -94,7 +92,7 @@ A browser window opens with the caption page. Useful flags:
 - `--wav test.wav` — replay a 16kHz mono WAV instead of the mic (a sample is included).
 - `--no-ui` — terminal-only output.
 
-Double-clickable launcher: edit the device index in `Babel.command`, then double-click it from Finder.
+Double-clickable launcher: open `Babel.command` from Finder. The host-only microphone chip in the caption header opens the device panel; settings persist locally in `solution/audio_config.json` (gitignored).
 
 ## Domain adaptation
 

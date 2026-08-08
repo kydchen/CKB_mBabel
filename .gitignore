@@ -2,6 +2,7 @@
 solution/transcripts/
 solution/.venv/
 solution/__pycache__/
+solution/audio_config.json*
 *.log
 .DS_Store
 .gstack/

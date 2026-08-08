@@ -10,6 +10,7 @@ Events:
 - {"type": "draft", "text": str}          live rough translation
 - {"type": "status", "text": str}         pipeline status (e.g. ASR reconnecting)
 - {"type": "share", "lan": str, "public": str}
+- {"type": "devices", ...}                host-only audio device state
 - {"type": "committed", "id": int, "lang": "zh"|"en", "source": str, "speaker": str|None}
 - {"type": "translation", "id": int, "text": str}
 """
@@ -35,6 +36,7 @@ class CaptionUI:
         self.port = port
         self.token = token
         self.clients: dict[asyncio.Queue, tuple] = {}  # outbox -> (sender task, ws)
+        self.control_clients: set[asyncio.Queue] = set()
         self.history: list[dict] = []  # replayed to late-joining browsers
         self.share: dict = {}  # {"lan": url, "public": url}, sent to every client
         self.on_control = None  # async callback for UI control messages
@@ -101,6 +103,7 @@ class CaptionUI:
                 req_headers = getattr(getattr(ws, "request", None), "headers", {})
                 tunneled = "Cf-Connecting-Ip" in req_headers or "Cf-Ray" in req_headers
                 if host in ("127.0.0.1", "::1") and not tunneled:
+                    self.control_clients.add(outbox)
                     await ws.send(json.dumps(
                         {"type": "control_token", "token": self.control_token}))
                 try:
@@ -117,6 +120,7 @@ class CaptionUI:
                 except websockets.exceptions.ConnectionClosed:
                     pass  # client gone (or force-closed as too slow); cleanup below
             finally:
+                self.control_clients.discard(outbox)
                 self.clients.pop(outbox, None)
                 task.cancel()
 
@@ -137,5 +141,22 @@ class CaptionUI:
                 # catches the viewer back up. Just cancelling the sender
                 # would leave an open-but-dead socket: frozen page, green dot.
                 task.cancel()
+                self.clients.pop(outbox, None)
+                asyncio.create_task(ws.close(code=1013))
+
+    async def emit_control(self, event: dict) -> None:
+        """Push host controls only to direct loopback clients."""
+        msg = json.dumps(event, ensure_ascii=False)
+        for outbox in list(self.control_clients):
+            client = self.clients.get(outbox)
+            if not client:
+                self.control_clients.discard(outbox)
+                continue
+            task, ws = client
+            try:
+                outbox.put_nowait(msg)
+            except asyncio.QueueFull:
+                task.cancel()
+                self.control_clients.discard(outbox)
                 self.clients.pop(outbox, None)
                 asyncio.create_task(ws.close(code=1013))

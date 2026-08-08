@@ -68,7 +68,26 @@ class DraftAsr(DummyAsr):
         yield SimpleNamespace(text="", utterances=[], is_last=True)
 
 
+class CommittedWithResidualAsr(DummyAsr):
+    async def transcribe(self, chunks):
+        yield SimpleNamespace(
+            text="你能听到我说话吗？",
+            utterances=[{
+                "definite": True,
+                "text": "你能听到我说话吗？",
+                "start_time": 0,
+                "end_time": 100,
+                "additions": {"speaker_id": "2", "lid_lang": "speech_mand"},
+            }],
+            is_last=False,
+        )
+        await asyncio.sleep(0.05)
+        yield SimpleNamespace(text="", utterances=[], is_last=True)
+
+
 class DummyUI:
+    events = []
+
     def __init__(self, host, port, token=None):
         self.port = port
         self.control_token = "offline"
@@ -78,7 +97,7 @@ class DummyUI:
         pass
 
     async def emit(self, event):
-        pass
+        self.events.append(dict(event))
 
     async def set_share(self, lan, public):
         pass
@@ -87,8 +106,7 @@ class DummyUI:
 def make_args(temp_dir, wav):
     return SimpleNamespace(
         wav=wav,
-        device=None,
-        channels=1,
+        audio_config=os.path.join(temp_dir, "audio_config.json"),
         glossary=os.path.join(SOLUTION, "glossary.json"),
         hotwords_dir=os.path.join(temp_dir, "hotwords"),
         translator="volc-mt",
@@ -113,35 +131,79 @@ async def signal_check(temp_dir):
 
 
 async def audio_failure_check(temp_dir):
-    import sounddevice
+    async def failed_audio(_self):
+        raise RuntimeError("no usable microphone detected")
 
-    class LiveStream:
-        active = True
-
-        def __init__(self, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-    args = make_args(temp_dir, None)
-    args.device = "Aggregate Device"
-    with patch.object(sounddevice, "query_devices", return_value={
-            "name": "Aggregate Device", "max_input_channels": 4}), \
-         patch.object(sounddevice, "RawInputStream", LiveStream), \
-         patch.object(babel, "coreaudio_devices",
-                      side_effect=[{41: "Wireless Microphone", 42: "Aggregate Device"},
-                                   {42: "Aggregate Device"}]), \
-         patch.object(babel, "coreaudio_subdevices", return_value={41}):
+    with patch.object(babel.AudioMixer, "run", failed_audio):
         try:
-            await asyncio.wait_for(babel.run(args), 2)
+            await asyncio.wait_for(babel.run(make_args(temp_dir, None)), 2)
         except SystemExit as e:
-            assert "audio input device or subdevice disconnected" in str(e), e
+            assert "no usable microphone detected" in str(e), e
         else:
             raise AssertionError("audio failure did not exit")
+
+
+async def wav_failure_check(temp_dir):
+    async def failed_wav(*_args):
+        raise RuntimeError("broken wav")
+
+    with patch.object(babel, "wav_chunks", failed_wav):
+        try:
+            await asyncio.wait_for(
+                babel.run(make_args(temp_dir, os.path.join(temp_dir, "broken.wav"))), 2
+            )
+        except SystemExit as e:
+            assert "broken wav" in str(e), e
+        else:
+            raise AssertionError("wav producer failure did not exit")
+
+
+async def audio_mixer_check(temp_dir):
+    import array
+
+    config = os.path.join(temp_dir, "mixer.json")
+    with open(config, "w", encoding="utf-8") as f:
+        f.write('{"microphone":"Wireless Microphone","capture_system":true}')
+    queue = asyncio.Queue()
+    mixer = babel.AudioMixer(queue, config)
+    restarts = []
+
+    async def restarted(refresh):
+        restarts.append(refresh)
+
+    mixer.restart_streams = restarted
+    present = {
+        "microphones": ["Wireless Microphone", "MacBook Pro Microphone"],
+        "outputs": ["MacBook Pro Speakers"],
+        "default_input": "MacBook Pro Microphone",
+        "default_output": "MacBook Pro Speakers",
+        "blackhole": "BlackHole 2ch",
+    }
+    unplugged = {**present, "microphones": ["MacBook Pro Microphone"]}
+    with patch.object(babel, "discover_audio_devices",
+                      side_effect=[present, unplugged]):
+        await mixer.scan(initial=True)
+        await mixer.scan()
+    assert mixer.microphone == "MacBook Pro Microphone"
+    assert restarts == [True]
+    assert "disappeared" in mixer.warning
+
+    with patch.object(babel, "discover_audio_devices", return_value=present):
+        await mixer.apply("Wireless Microphone", False, "MacBook Pro Speakers")
+    assert mixer.microphone == "Wireless Microphone"
+    assert restarts == [True, True]
+    assert mixer.panel_seen
+
+    mixer.capture_system = True
+    mixer.system_stream = object()
+    pack = lambda value: array.array("h", [value]).tobytes()
+    mixer._receive_system(pack(100))
+    mixer._receive_system(pack(200))
+    mixer._receive_system(pack(300))
+    mixer._receive_mic(pack(1000))
+    assert list(array.array("h", queue.get_nowait())) == [1200]
+    assert mixer.stats["system_drop"] == 1
+    assert list(array.array("h", babel.mix_pcm_s16(pack(30000), pack(10000)))) == [32767]
 
 
 async def draft_reset_check(temp_dir):
@@ -156,6 +218,19 @@ async def draft_reset_check(temp_dir):
     assert drafts == ["这是第一句非常非常长的内容", "第二句开头六字"], drafts
 
 
+async def committed_draft_clear_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    DummyTranslator.calls.clear()
+    DummyUI.events.clear()
+    with patch.object(babel, "VolcAsrClient", CommittedWithResidualAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True):
+        await babel.run(args)
+    stale = [event for event in DummyUI.events if event["type"] == "draft"]
+    assert stale == [], stale
+
+
 with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
     os.mkdir(os.path.join(temp_dir, "hotwords"))
     babel.__file__ = os.path.join(temp_dir, "main.py")
@@ -166,7 +241,10 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         started = time.monotonic()
         asyncio.run(signal_check(temp_dir))
         asyncio.run(audio_failure_check(temp_dir))
+        asyncio.run(wav_failure_check(temp_dir))
+        asyncio.run(audio_mixer_check(temp_dir))
         asyncio.run(draft_reset_check(temp_dir))
+        asyncio.run(committed_draft_clear_check(temp_dir))
         assert time.monotonic() - started < 5
 
-print("runtime: draft reset, SIGTERM save, and audio-failure exit pass")
+print("runtime: draft reset/clear, SIGTERM save, producer failures, and mixer fallback pass")

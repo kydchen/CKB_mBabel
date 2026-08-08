@@ -137,6 +137,21 @@ def downmix_to_mono(data: bytes, channels: int) -> bytes:
     return out.tobytes()
 
 
+def mix_pcm_s16(microphone: bytes, system: bytes) -> bytes:
+    """Sum two mono s16le blocks with int32 accumulation and clipping."""
+    import array
+
+    mic = array.array("h")
+    mic.frombytes(microphone)
+    other = array.array("h")
+    other.frombytes(system)
+    out = array.array("h", bytes(len(mic) * 2))
+    for i, sample in enumerate(mic):
+        mixed = sample + (other[i] if i < len(other) else 0)
+        out[i] = max(-32768, min(32767, mixed))
+    return out.tobytes()
+
+
 _COREAUDIO = None
 
 
@@ -210,90 +225,371 @@ def coreaudio_devices() -> dict[int, str] | None:
     return devices
 
 
-def coreaudio_subdevices(device_id: int) -> set[int]:
-    """Return active subdevices for a macOS Aggregate Device."""
+def coreaudio_device_channels(device_id: int, scope: str) -> int:
+    """Read the live channel count from a CoreAudio AudioBufferList."""
     if _COREAUDIO is None:
-        return set()
+        return 0
 
     import ctypes
 
     ca, _, Address = _COREAUDIO
     fourcc = lambda value: int.from_bytes(value.encode(), "big")
-    address = Address(fourcc("agrp"), fourcc("glob"), 0)
+    address = Address(fourcc("slay"), fourcc(scope), 0)
     size = ctypes.c_uint32()
     if ca.AudioObjectGetPropertyDataSize(
         device_id, ctypes.byref(address), 0, None, ctypes.byref(size)
     ):
-        return set()
-    ids = (ctypes.c_uint32 * (size.value // 4))()
+        return 0
+    raw = ctypes.create_string_buffer(size.value)
     if ca.AudioObjectGetPropertyData(
-        device_id, ctypes.byref(address), 0, None, ctypes.byref(size), ids
+        device_id, ctypes.byref(address), 0, None, ctypes.byref(size), raw
     ):
-        return set()
-    return {int(value) for value in ids}
+        return 0
+
+    class AudioBuffer(ctypes.Structure):
+        _fields_ = [("channels", ctypes.c_uint32),
+                    ("byte_size", ctypes.c_uint32),
+                    ("data", ctypes.c_void_p)]
+
+    count = ctypes.c_uint32.from_buffer(raw).value
+    alignment = ctypes.alignment(AudioBuffer)
+    offset = (ctypes.sizeof(ctypes.c_uint32) + alignment - 1) // alignment * alignment
+    return sum(AudioBuffer.from_buffer(
+        raw, offset + i * ctypes.sizeof(AudioBuffer)
+    ).channels for i in range(count))
 
 
-async def mic_chunks(queue: asyncio.Queue, device: int | str | None = None,
-                     channels: int = 1) -> None:
-    """Capture mic audio with sounddevice; None signals end.
+def coreaudio_default_device(selector: str) -> int | None:
+    if _COREAUDIO is None:
+        return None
 
-    channels > 1 is for an Aggregate Device that merges several sources
-    (e.g. BlackHole for remote participants + a microphone for yourself);
-    all channels are downmixed to mono.
-    """
-    import sounddevice as sd
+    import ctypes
 
-    loop = asyncio.get_running_loop()
-    device_name = str(sd.query_devices(device, "input")["name"])
-    native_devices = coreaudio_devices()
-    native_ids = ({device_id for device_id, name in native_devices.items()
-                   if name == device_name} if native_devices is not None else set())
-    for device_id in tuple(native_ids):
-        native_ids.update(coreaudio_subdevices(device_id))
+    ca, _, Address = _COREAUDIO
+    fourcc = lambda value: int.from_bytes(value.encode(), "big")
+    address = Address(fourcc(selector), fourcc("glob"), 0)
+    size = ctypes.c_uint32(4)
+    value = ctypes.c_uint32()
+    if ca.AudioObjectGetPropertyData(
+        1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(value)
+    ):
+        return None
+    return int(value.value)
 
-    dropped = {"n": 0}
 
-    def callback(indata, frames, time_info, status):
-        data = bytes(indata)
-        if channels > 1:
-            data = downmix_to_mono(data, channels)
+def discover_audio_devices() -> dict:
+    """Return current real microphones, outputs, defaults, and BlackHole."""
+    devices = coreaudio_devices()
+    if devices is not None:
+        details = [{
+            "id": device_id,
+            "name": name,
+            "inputs": coreaudio_device_channels(device_id, "inpt"),
+            "outputs": coreaudio_device_channels(device_id, "outp"),
+        } for device_id, name in devices.items()]
+        default_input_id = coreaudio_default_device("dIn ")
+        default_output_id = coreaudio_default_device("dOut")
+    else:
+        import sounddevice as sd
 
-        def _offer() -> None:
+        raw = sd.query_devices()
+        details = [{
+            "id": i,
+            "name": str(info["name"]),
+            "inputs": int(info["max_input_channels"]),
+            "outputs": int(info["max_output_channels"]),
+        } for i, info in enumerate(raw)]
+        default_input_id, default_output_id = sd.default.device
+
+    virtual = ("blackhole", "multi-output", "aggregate", "iflyrec")
+    real = lambda item: not any(v in item["name"].lower() for v in virtual)
+    microphones = [d["name"] for d in details if d["inputs"] > 0 and real(d)]
+    outputs = [d["name"] for d in details if d["outputs"] > 0 and real(d)]
+    blackhole = next((d["name"] for d in details
+                      if d["inputs"] > 0 and "blackhole" in d["name"].lower()), None)
+    by_id = {d["id"]: d["name"] for d in details}
+    return {
+        "microphones": microphones,
+        "outputs": outputs,
+        "default_input": by_id.get(default_input_id),
+        "default_output": by_id.get(default_output_id),
+        "blackhole": blackhole,
+    }
+
+
+class AudioMixer:
+    """Hot-switchable mic + optional BlackHole mixer feeding the ASR queue."""
+
+    def __init__(self, queue: asyncio.Queue, config_path: str):
+        self.queue = queue
+        self.config_path = config_path
+        self.loop = None
+        self.mic_stream = None
+        self.system_stream = None
+        self.system_chunks = []
+        self.discovery = {"microphones": [], "outputs": [],
+                          "default_input": None, "default_output": None,
+                          "blackhole": None}
+        self.warning = ""
+        self.on_state = None
+        self.lock = asyncio.Lock()
+        self.stats = {"system_underflow": 0, "system_drop": 0, "queue_drop": 0}
+        self.last_scan = time.monotonic()
+        self.last_stats = time.monotonic()
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError, TypeError):
+            saved = {}
+        self.microphone = saved.get("microphone")
+        self.capture_system = bool(saved.get("capture_system", False))
+        self.speaker = saved.get("speaker")
+        self.panel_seen = bool(saved.get("panel_seen", False))
+
+    def snapshot(self) -> dict:
+        return {
+            "type": "devices",
+            "microphones": self.discovery["microphones"],
+            "outputs": self.discovery["outputs"],
+            "microphone": self.microphone,
+            "capture_system": self.capture_system,
+            "speaker": self.speaker,
+            "blackhole": bool(self.discovery["blackhole"]),
+            "warning": self.warning,
+            "first_run": not self.panel_seen,
+            **self.stats,
+        }
+
+    def persist(self) -> None:
+        data = {
+            "microphone": self.microphone,
+            "capture_system": self.capture_system,
+            "speaker": self.speaker,
+            "panel_seen": self.panel_seen,
+        }
+        tmp = self.config_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.config_path)
+        except OSError as e:
+            print(f"[audio] cannot persist device settings: {e}", file=sys.stderr)
+
+    async def notify(self) -> None:
+        if self.on_state:
+            await self.on_state(self.snapshot())
+
+    def _fallbacks(self) -> tuple[str | None, str | None]:
+        microphones = self.discovery["microphones"]
+        outputs = self.discovery["outputs"]
+        default_mic = self.discovery["default_input"]
+        default_output = self.discovery["default_output"]
+        microphone = default_mic if default_mic in microphones else next(iter(microphones), None)
+        speaker = default_output if default_output in outputs else next(iter(outputs), None)
+        return microphone, speaker
+
+    async def scan(self, initial: bool = False, notify: bool = True) -> None:
+        self.discovery = discover_audio_devices()
+        fallback_mic, fallback_speaker = self._fallbacks()
+        restart = False
+        changed = False
+        if self.microphone not in self.discovery["microphones"]:
+            old = self.microphone
+            self.microphone = fallback_mic
+            restart = not initial
+            changed = True
+            if old:
+                self.warning = f"Microphone disappeared: {old}; switched to {fallback_mic or 'none'}"
+                print(f"[audio] {self.warning}", file=sys.stderr)
+        if self.speaker not in self.discovery["outputs"]:
+            if self.speaker != fallback_speaker:
+                self.speaker = fallback_speaker
+                changed = True
+        if self.capture_system and not self.discovery["blackhole"]:
+            self.capture_system = False
+            restart = not initial
+            changed = True
+            self.warning = "BlackHole disappeared; system-audio capture was turned off"
+            print(f"[audio] {self.warning}", file=sys.stderr)
+        if not self.microphone:
+            raise RuntimeError("no usable microphone detected")
+        if initial or changed:
+            self.persist()
+        if restart:
+            await self.restart_streams(refresh=True)
+        if notify:
+            await self.notify()
+
+    async def apply(self, microphone: str | None, capture_system: bool,
+                    speaker: str | None) -> None:
+        await self.scan(notify=False)
+        restart = False
+        if microphone in self.discovery["microphones"] and microphone != self.microphone:
+            self.microphone = microphone
+            restart = True
+        requested_system = bool(capture_system and self.discovery["blackhole"])
+        if requested_system != self.capture_system:
+            self.capture_system = requested_system
+            restart = True
+        if speaker in self.discovery["outputs"]:
+            self.speaker = speaker
+        self.panel_seen = True
+        self.warning = ("BlackHole 2ch is not installed"
+                        if capture_system and not self.discovery["blackhole"] else "")
+        self.persist()
+        if restart:
             try:
-                queue.put_nowait(data)
-            except asyncio.QueueFull:
-                # drop the OLDEST chunk, not the new one, and make it loud;
-                # this is the buffer that carries us through ASR reconnects
+                await self.restart_streams(refresh=True)
+            except Exception as e:
+                failed = self.microphone
+                fallback, _ = self._fallbacks()
+                if not fallback or fallback == failed:
+                    raise
+                self.microphone = fallback
+                self.warning = f"Cannot open {failed}; switched to {fallback}: {e}"
+                self.persist()
+                await self.restart_streams(refresh=True)
+        await self.notify()
+
+    async def mark_seen(self) -> None:
+        self.panel_seen = True
+        self.persist()
+        await self.notify()
+
+    def _close_streams(self) -> None:
+        for stream in (self.mic_stream, self.system_stream):
+            if stream is None:
+                continue
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self.mic_stream = self.system_stream = None
+        self.system_chunks.clear()
+
+    @staticmethod
+    def _portaudio_input(sd, name: str) -> tuple[int, int]:
+        for index, info in enumerate(sd.query_devices()):
+            if str(info["name"]) == name and int(info["max_input_channels"]) > 0:
+                return index, int(info["max_input_channels"])
+        raise RuntimeError(f"input device is unavailable to PortAudio: {name}")
+
+    def _callback(self, source: str, channels: int):
+        def callback(indata, frames, time_info, status):
+            data = bytes(indata)
+            if channels > 1:
+                data = downmix_to_mono(data, channels)
+            if status:
+                print(f"[audio] {source} stream status: {status}", file=sys.stderr)
+            handler = self._receive_mic if source == "microphone" else self._receive_system
+            self.loop.call_soon_threadsafe(handler, data)
+        return callback
+
+    def _receive_system(self, data: bytes) -> None:
+        if len(self.system_chunks) >= 2:  # 400ms ceiling at the 200ms block size
+            self.system_chunks.pop(0)
+            self.stats["system_drop"] += 1
+        self.system_chunks.append(data)
+
+    def _receive_mic(self, data: bytes) -> None:
+        if self.capture_system and self.system_stream is not None:
+            if self.system_chunks:
+                data = mix_pcm_s16(data, self.system_chunks.pop(0))
+            else:
+                self.stats["system_underflow"] += 1
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull:
+            try:
+                self.queue.get_nowait()
+                self.queue.put_nowait(data)
+            except Exception:
+                pass
+            self.stats["queue_drop"] += 1
+            if self.stats["queue_drop"] % 50 == 1:
+                print(f"[audio] queue full, dropped oldest chunks: "
+                      f"{self.stats['queue_drop']}", file=sys.stderr)
+
+    async def restart_streams(self, refresh: bool) -> None:
+        import sounddevice as sd
+
+        async with self.lock:
+            self._close_streams()
+            if refresh:
+                sd._terminate()
+                sd._initialize()
+            mic_index, mic_channels = self._portaudio_input(sd, self.microphone)
+            self.mic_stream = sd.RawInputStream(
+                device=mic_index, samplerate=SAMPLE_RATE,
+                blocksize=SAMPLE_RATE * CHUNK_MS // 1000,
+                dtype="int16", channels=mic_channels,
+                callback=self._callback("microphone", mic_channels),
+            )
+            self.mic_stream.start()
+            if self.capture_system and self.discovery["blackhole"]:
                 try:
-                    queue.get_nowait()
-                    queue.put_nowait(data)
-                except Exception:
-                    pass
-                dropped["n"] += 1
-                if dropped["n"] % 50 == 1:
-                    print(f"[audio] queue full, dropped oldest chunks: "
-                          f"{dropped['n']}", file=sys.stderr)
+                    system_index, system_channels = self._portaudio_input(
+                        sd, self.discovery["blackhole"]
+                    )
+                    self.system_stream = sd.RawInputStream(
+                        device=system_index, samplerate=SAMPLE_RATE,
+                        blocksize=SAMPLE_RATE * CHUNK_MS // 1000,
+                        dtype="int16", channels=system_channels,
+                        callback=self._callback("system", system_channels),
+                    )
+                    self.system_stream.start()
+                except Exception as e:
+                    self.capture_system = False
+                    self.warning = f"Cannot open BlackHole; system-audio capture is off: {e}"
+                    self.persist()
+            print(f"[audio] microphone={self.microphone} ({mic_channels}ch), "
+                  f"system={'on' if self.system_stream else 'off'}")
 
-        loop.call_soon_threadsafe(_offer)
+    async def _reopen(self) -> None:
+        """Reopen the streams after one stopped. A Bluetooth mic (AirPods)
+        vanishes together with its stream, so reopening the same name can
+        raise; clear it and let scan() fall back to another microphone
+        instead of killing the pipeline."""
+        try:
+            await self.restart_streams(refresh=True)
+        except Exception as e:
+            print(f"[audio] reopen failed: {e}", file=sys.stderr)
+            self.microphone = None
+            await self.scan()
 
-    with sd.RawInputStream(
-        device=device,
-        samplerate=SAMPLE_RATE,
-        blocksize=SAMPLE_RATE * CHUNK_MS // 1000,
-        dtype="int16",
-        channels=channels,
-        callback=callback,
-    ) as stream:
-        while True:
-            await asyncio.sleep(0.5)
-            if not stream.active:
-                raise RuntimeError("audio input stream stopped")
-            current_devices = coreaudio_devices()
-            if (native_ids and current_devices is not None
-                    and not native_ids.issubset(current_devices)):
-                raise RuntimeError(
-                    f"audio input device or subdevice disconnected: {device_name}"
-                )
+    async def run(self) -> None:
+        import sounddevice as sd
+
+        self.loop = asyncio.get_running_loop()
+        sd.query_devices()  # initializes CoreAudio before native enumeration
+        try:
+            await self.scan(initial=True)
+            await self.restart_streams(refresh=False)
+            await self.notify()
+            while True:
+                await asyncio.sleep(0.5)
+                if not self.mic_stream or not self.mic_stream.active:
+                    self.warning = "Microphone stream stopped; reopening"
+                    await self._reopen()
+                    await self.notify()
+                elif (self.capture_system
+                      and (not self.system_stream or not self.system_stream.active)):
+                    self.warning = "System-audio stream stopped; reopening"
+                    await self._reopen()
+                    await self.notify()
+                now = time.monotonic()
+                if now - self.last_scan >= 3:
+                    self.last_scan = now
+                    await self.scan()
+                if now - self.last_stats >= 60:
+                    print(f"[audio] mixer counters: {self.stats}")
+                    self.last_stats = now
+        finally:
+            self._close_streams()
 
 
 async def wav_chunks(path: str, queue: asyncio.Queue) -> None:
@@ -388,29 +684,6 @@ async def maybe_tunnel(port: int):
 
 
 async def run(args) -> None:
-    device = args.device
-    if isinstance(device, str):
-        try:
-            device = int(device)
-        except ValueError:
-            pass  # sounddevice accepts a device name substring
-    if not args.wav:
-        import sounddevice as sd
-
-        try:
-            info = sd.query_devices(device, "input")
-            max_channels = int(info["max_input_channels"])
-            if not 1 <= args.channels <= max_channels:
-                raise ValueError(
-                    f"requested {args.channels} channels, device supports {max_channels}"
-                )
-        except Exception as e:
-            print(f"[audio] cannot use input device {device!r}: {e}", file=sys.stderr)
-            print("[audio] available devices:", file=sys.stderr)
-            devices = sd.query_devices()
-            print(devices if len(devices) else "(none detected)", file=sys.stderr)
-            raise SystemExit(2)
-
     glossary = Glossary.load(args.glossary)
     # Merge hotword files: English/proper nouns become identity translation
     # terms (kept as-is, e.g. "Meepo"), Chinese entries only feed ASR.
@@ -574,6 +847,11 @@ async def run(args) -> None:
         return {k: sum(1 for t in dq if now - t < 60)
                 for k, dq in req_stats.items()}
 
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    audio = (None if args.wav else AudioMixer(queue, args.audio_config))
+    if audio and ui:
+        audio.on_state = ui.emit_control
+
     async def on_control(msg: dict) -> None:
         """Control messages from the UI (token-guarded in ui_server)."""
         kind = msg.get("type")
@@ -599,30 +877,36 @@ async def run(args) -> None:
         elif kind == "stats":
             if ui:
                 await ui.emit({"type": "stats", **stats_snapshot()})
+        elif kind == "devices_get" and audio and ui:
+            await ui.emit_control(audio.snapshot())
+        elif kind == "devices_seen" and audio:
+            await audio.mark_seen()
+        elif kind == "audio_settings" and audio:
+            await audio.apply(msg.get("microphone"),
+                              bool(msg.get("capture_system")),
+                              msg.get("speaker"))
 
     if ui:
         ui.on_control = on_control
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     run_task = asyncio.current_task()
     assert run_task is not None
     audio_failure = {"error": None}
     producer = (
         asyncio.create_task(wav_chunks(args.wav, queue))
         if args.wav
-        else asyncio.create_task(mic_chunks(queue, device=device, channels=args.channels))
+        else asyncio.create_task(audio.run())
     )
-    if not args.wav:
-        def audio_done(task: asyncio.Task) -> None:
-            if task.cancelled():
-                return
-            error = task.exception()
-            if error is not None:
-                audio_failure["error"] = error
-                print(f"[audio] input failed: {error}", file=sys.stderr)
-                run_task.cancel()
+    def audio_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            audio_failure["error"] = error
+            print(f"[audio] input failed: {error}", file=sys.stderr)
+            run_task.cancel()
 
-        producer.add_done_callback(audio_done)
+    producer.add_done_callback(audio_done)
 
     committed: set[tuple[int, int, str]] = set()
     translate_tasks: list[asyncio.Task] = []
@@ -831,6 +1115,7 @@ async def run(args) -> None:
                             await ui.emit({"type": "status", "text": "connected"})
                     if event.text or event.utterances:
                         last_activity["t"] = asyncio.get_running_loop().time()
+                    packet_seg_seq = seg_seq
                     for utt in event.utterances:
                         key = (utt.get("start_time", 0), utt.get("end_time", 0),
                                (utt.get("text") or "")[:16])
@@ -860,8 +1145,14 @@ async def run(args) -> None:
                                 current = "".join(line_parts).strip()
                                 if current.endswith(FINAL_PUNCT) or len(current) >= MAX_LINE_CHARS:
                                     await flush_line()
-                    if event.text or line_parts:
-                        line = "".join(line_parts) + correct(event.text)
+                    # result.text can repeat a definite utterance from this
+                    # same ASR packet. Once that utterance committed, treating
+                    # the repeated text as a new partial launches a stale draft
+                    # after the committed event has already cleared the strip.
+                    packet_committed = seg_seq != packet_seg_seq
+                    if line_parts or (event.text and not packet_committed):
+                        live_text = "" if packet_committed else correct(event.text)
+                        line = "".join(line_parts) + live_text
                         text = line.strip()
                         now = asyncio.get_running_loop().time()
                         # Draft budget: QPM is per-account and reserved for
@@ -1002,14 +1293,11 @@ def main() -> None:
                         help="path to the .env file with API credentials")
     parser.add_argument("--hotwords-dir", default=os.path.join(os.path.dirname(__file__), "..", "hotwords"),
                         help="directory with *.txt hotword files (merged with the glossary)")
-    parser.add_argument("--device", default=None,
-                        help="input device index (see --list-devices) or a device name "
-                             "substring, e.g. --device Aggregate")
-    parser.add_argument("--channels", type=int, default=1,
-                        help="input channels to downmix; use 4 for an Aggregate Device "
-                             "combining BlackHole (2ch) + a stereo mic (2ch)")
     parser.add_argument("--list-devices", action="store_true",
                         help="list audio input devices and exit")
+    parser.add_argument("--audio-config",
+                        default=os.path.join(os.path.dirname(__file__), "audio_config.json"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, default=8765,
                         help="caption UI port (default 8765); pick another to run "
                              "two instances side by side")
