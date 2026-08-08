@@ -1,12 +1,14 @@
 """Offline regression checks for P0 runtime behavior."""
 
 import asyncio
+import io
 import os
 import signal
 import tempfile
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import redirect_stdout
 
 import main as babel
 
@@ -120,6 +122,66 @@ class CommittedWithResidualAsr(DummyAsr):
         yield SimpleNamespace(text="", utterances=[], is_last=True)
 
 
+class ContextAsr(DummyAsr):
+    async def transcribe(self, chunks):
+        utterances = []
+        for index in range(1, 7):
+            utterances.append({
+                "definite": True,
+                "text": f"第{index}句上下文。",
+                "start_time": index * 100,
+                "end_time": index * 100 + 99,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            })
+        yield SimpleNamespace(text="", utterances=utterances, is_last=True)
+
+
+class PauseAsr(DummyAsr):
+    sessions = 0
+    close_calls = 0
+
+    async def close(self):
+        type(self).close_calls += 1
+
+    async def transcribe(self, chunks):
+        type(self).sessions += 1
+        if self.sessions == 1:
+            # a sentence finished BEFORE the pause, still interim-only: it
+            # must settle as a caption instead of vanishing with the session
+            yield SimpleNamespace(text="暂停前已经说完的话", utterances=[],
+                                  is_last=False)
+            await DummyUI.instance.on_control({"type": "pause", "paused": True})
+
+            async def resume():
+                await asyncio.sleep(0.02)
+                await DummyUI.instance.on_control({"type": "pause", "paused": False})
+
+            asyncio.create_task(resume())
+            return
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "恢复后的句子。",
+                "start_time": 0,
+                "end_time": 100,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
+            is_last=True,
+        )
+
+
+class HotwordAsr(DummyAsr):
+    direct = []
+
+    def __init__(self, config):
+        super().__init__(config)
+        type(self).direct = list(config.hotwords)
+
+    async def transcribe(self, chunks):
+        yield SimpleNamespace(text="", utterances=[], is_last=True)
+
+
 class ReconnectingAsr(DummyAsr):
     sessions = 0
     received = []
@@ -177,8 +239,10 @@ class ReconnectingAsr(DummyAsr):
 
 class DummyUI:
     events = []
+    instance = None
 
     def __init__(self, host, port, token=None):
+        type(self).instance = self
         self.port = port
         self.control_token = "offline"
         self.on_control = None
@@ -187,6 +251,9 @@ class DummyUI:
         pass
 
     async def emit(self, event):
+        self.events.append(dict(event))
+
+    async def emit_control(self, event):
         self.events.append(dict(event))
 
     async def set_share(self, lan, public):
@@ -294,6 +361,11 @@ async def audio_mixer_check(temp_dir):
     assert list(array.array("h", queue.get_nowait())) == [1200]
     assert mixer.stats["system_drop"] == 1
     assert list(array.array("h", babel.mix_pcm_s16(pack(30000), pack(10000)))) == [32767]
+    mixer.system_chunks.clear()
+    mixer.paused = True
+    mixer._receive_system(pack(200))
+    mixer._receive_mic(pack(1000))
+    assert queue.empty() and mixer.system_chunks == []
 
 
 async def draft_reset_check(temp_dir):
@@ -332,6 +404,58 @@ async def committed_draft_clear_check(temp_dir):
         await babel.run(args)
     stale = [event for event in DummyUI.events if event["type"] == "draft"]
     assert stale == [], stale
+
+
+async def context_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    DummyTranslator.calls.clear()
+    with patch.object(babel, "VolcAsrClient", ContextAsr):
+        await babel.run(args)
+    sixth = next(kwargs for text, kwargs in DummyTranslator.calls
+                 if text == "第6句上下文。")
+    context = sixth["context"]
+    assert [item["source"] for item in context] == [
+        "第2句上下文。", "第3句上下文。", "第4句上下文。", "第5句上下文。"
+    ], context
+    assert [item["translation"] for item in context] == ["translated"] * 4
+
+
+async def pause_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    DummyUI.events.clear()
+    PauseAsr.sessions = 0
+    PauseAsr.close_calls = 0
+    with patch.object(babel, "VolcAsrClient", PauseAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True):
+        await babel.run(args)
+    states = [event["paused"] for event in DummyUI.events
+              if event.get("type") == "pause_state"]
+    assert states == [True, False], states
+    assert PauseAsr.sessions == 2
+    assert PauseAsr.close_calls == 1
+    sources = [event["source"] for event in DummyUI.events
+               if event.get("type") == "committed"]
+    assert sources == ["暂停前已经说完的话", "恢复后的句子。"], sources
+
+
+async def hotword_budget_check(temp_dir):
+    budget_dir = os.path.join(temp_dir, "budget-hotwords")
+    os.mkdir(budget_dir)
+    with open(os.path.join(budget_dir, "high.txt"), "w", encoding="utf-8") as f:
+        f.write("#priority high\n" + "\n".join(f"Critical{i}" for i in range(98)))
+    with open(os.path.join(budget_dir, "low.txt"), "w", encoding="utf-8") as f:
+        f.write("#priority low\nlow one\nlow two\n")
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.hotwords_dir = budget_dir
+    output = io.StringIO()
+    with patch.object(babel, "VolcAsrClient", HotwordAsr), redirect_stdout(output):
+        await babel.run(args)
+    assert sum(babel.hotword_token_cost(word) for word in HotwordAsr.direct) <= 100
+    assert "Critical97" in HotwordAsr.direct
+    assert "low two" not in HotwordAsr.direct
+    assert "dropped" in output.getvalue() and "low two" in output.getvalue()
 
 
 async def reconnect_check(temp_dir):
@@ -391,7 +515,10 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(draft_reset_check(temp_dir))
         asyncio.run(draft_promotion_check(temp_dir))
         asyncio.run(committed_draft_clear_check(temp_dir))
+        asyncio.run(context_check(temp_dir))
+        asyncio.run(pause_check(temp_dir))
+        asyncio.run(hotword_budget_check(temp_dir))
         asyncio.run(reconnect_check(temp_dir))
         assert time.monotonic() - started < 5
 
-print("runtime: drafts, signals, producer failures, mixer fallback, and reconnect pass")
+print("runtime: drafts, context, pause, signals, mixer fallback, and reconnect pass")

@@ -68,6 +68,9 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # use a mirror if PyPI is slow
 ```
 
+Optional macOS app: double-click `install-app.command` once. It builds a local
+`mBabel.app` for this clone in `/Applications` (or `~/Applications`).
+
 ### 3. Audio routing (macOS)
 
 - In-person meetings: nothing to do, the MacBook mic works.
@@ -92,11 +95,11 @@ A browser window opens with the caption page. Useful flags:
 - `--wav test.wav` — replay a 16kHz mono WAV instead of the mic (a sample is included).
 - `--no-ui` — terminal-only output.
 
-Double-clickable launcher: open `Babel.command` from Finder. The host-only microphone chip in the caption header opens the device panel; settings persist locally in `solution/audio_config.json` (gitignored).
+Double-click `mBabel.app` (after the optional install above) or `Babel.command`. The host-only microphone chip opens the device panel; settings persist locally in `solution/audio_config.json` (gitignored).
 
 ## Domain adaptation
 
-- `hotwords/hotwords.txt`, `hotwords/hotwords_zh.txt` — ASR hotwords, one per line. English proper nouns also become identity terms in the translation glossary (kept as-is).
+- `hotwords/hotwords.txt`, `hotwords/hotwords_zh.txt` — ASR hotwords, one per line. `#priority high|normal|low` starts a priority section; low-priority terms are trimmed first at the 100-token direct cap. English proper nouns also become identity terms in the translation glossary (kept as-is).
 - `solution/glossary.json` — `terms`: zh↔en pairs for translation enforcement (values should be mixed forms like "Fiber网络" for en→zh; matching is case-sensitive, variants are generated). `corrections`: ASR mishearing fixes applied before display and translation.
 - `hotwords/boosting_table.txt` — regenerated on every run from the merged list (platform rules: <10 chars, no punctuation, digits spelled as Chinese characters). Upload it when the list changes.
 
@@ -108,6 +111,7 @@ The shipped lists are curated for the Nervos CKB blockchain ecosystem (mined fro
 solution/     the app (ASR client, translators, sentence accumulator, UI)
 hotwords/     domain hotword lists + generated boosting table
 Babel.command macOS double-click launcher
+install-app.command builds a local mBabel.app for this clone
 .env.example  credentials template
 ```
 
@@ -117,7 +121,7 @@ Transcripts land in `solution/transcripts/` (created at runtime, gitignored).
 
 - Speaker labels are cluster ids (说话人 1/2/…), stable within a session, not named identities.
 - Cloud processing means meeting audio leaves the machine; for fully offline needs this stack is not the answer.
-- No pause button yet: the ASR server closes idle sessions after ~8s, so a real pause needs coordinated sender/reconnect logic (planned).
+- The host-only Pause control closes ASR and discards audio until Resume; recovery uses the normal reconnect path.
 - Tested on macOS (Apple Silicon). The audio-capture layer is cross-platform in principle; the routing instructions are macOS-specific.
 
 ## License

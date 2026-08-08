@@ -9,7 +9,7 @@
 
 ## 工作原理
 
-`asr_client.py` 实现 Seed-ASR WebSocket 二进制协议(优化版双向流式 bigmodel_async),开启二遍识别:中间结果快,判停片段由非流式模型重识别保证准。热词双通道:直传 100 token(放平台规则不允许进词表的词加英文专名),其余走自学习平台词表。纠错映射(glossary.json 的 corrections)在上屏和送译前修正固定误识(MATE→Matt、CKC→CKCon、RGB 加加→RGB++)。
+`asr_client.py` 实现 Seed-ASR WebSocket 二进制协议(优化版双向流式 bigmodel_async),开启二遍识别:中间结果快,判停片段由非流式模型重识别保证准。热词双通道:直传按中文字符和英文空格词估算后控制在 100 token 内,`#priority high|normal|low` 分段决定保留顺序,其余走自学习平台词表。纠错映射(glossary.json 的 corrections)在上屏和送译前修正固定误识(MATE→Matt、CKC→CKCon、RGB 加加→RGB++)。
 
 `main.py` 的句子累积器:片段攒成活行,按句号、80 字后的首个逗号/顿号/分号子句边界、200 字上限、2 秒静音、语言边界(长英文段 vs 含中文段)或说话人切换结算。翻译默认 volc-mt 后端,实测每句 0.2-0.9 秒;术语表按方向翻转,大小写变体自动生成,英译中译值用中英混合形态("Fiber网络")强制效果最好。备用后端:ark(方舟豆包,需 ARK_API_KEY,必须关 thinking)和 qwen-mt(阿里)。
 
@@ -18,12 +18,13 @@
 1. 语音技术控制台(console.volcengine.com/speech):开通**豆包流式语音识别 2.0(小时版)**和**机器翻译大模型**(volc.speech.mt),创建 API Key。
 2. `../.env` 写 `VOLC_ASR_API_KEY=...`(程序自动加载);可选 `VOLC_BOOSTING_TABLE_ID`(自学习平台热词表,上传 ../hotwords/boosting_table.txt 后获得)。
 3. 安装:`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`(PyPI 慢加清华镜像 `-i https://pypi.tuna.tsinghua.edu.cn/simple`)。
+4. 可选:双击 `../install-app.command`,在 Applications 生成绑定当前克隆路径的 `mBabel.app`。
 
 ## 日常使用
 
 线上会议只需一次性安装 BlackHole 2ch,并在 macOS“音频 MIDI 设置”里建一个**多输出设备**:勾选扬声器/耳机与 BlackHole,扬声器放第一并作为时钟源,会议软件输出选这个多输出设备。不要再建聚合设备:Babel 会独立打开你选的麦克风和 BlackHole,按实际声道数转单声道后在程序内混音。
 
-每次开会双击 `../Babel.command`,或手动:
+每次开会双击 `mBabel.app` 或 `../Babel.command`,也可手动:
 
 ```bash
 cd CKBA/Babel/solution
@@ -31,7 +32,7 @@ cd CKBA/Babel/solution
 .venv/bin/python main.py --share           # 打印 LAN 链接;装了 cloudflared 自动出公网链接
 ```
 
-启动后浏览器自动打开字幕页。本机主持人顶栏会看到麦克风芯片:可选麦克风、会中热切换,并打开“采集会议声音”让 BlackHole 进入混音;设置保存在 gitignored 的 `audio_config.json`。当前麦克风消失时,3 秒内出现红色警告并自动回落系统默认麦,ASR 会话不断。没装 BlackHole 时线下麦克风照常可用,开关置灰并显示安装命令。
+启动后浏览器自动打开字幕页。本机主持人顶栏会看到麦克风芯片和暂停按钮:可选麦克风、会中热切换,并打开“采集会议声音”让 BlackHole 进入混音;暂停会主动断开 ASR 并丢弃期间音频,继续后走重连路径。设置保存在 gitignored 的 `audio_config.json`。当前麦克风消失时,3 秒内出现红色警告并自动回落系统默认麦,ASR 会话不断。没装 BlackHole 时线下麦克风照常可用,开关置灰并显示安装命令。
 
 ## 成本(2026-08,以控制台为准)
 
@@ -47,9 +48,9 @@ cd CKBA/Babel/solution
 - 浏览器断线重连按句子 id 幂等;历史重放走 await 直发,任意长度的历史都不会把晚加入者卡死。
 - `--share` 下页面挂在随机 token 路径下;cloudflared 隧道后台启动,不阻塞 ASR,公网链接就绪后自动出现在分享弹窗;卡死的观看端会被断开而不拖慢管线。
 - 设备列表每 3 秒刷新;当前麦克风消失时自动切到系统默认麦,不重连 ASR。
-- 草稿翻译固定 0.5 秒防抖,且用只含恒等术语(专名)的精简术语表,成本大幅下降而刷新不变慢。
+- 草稿翻译固定 0.6 秒防抖,且用只含恒等术语(专名)的精简术语表,成本大幅下降而刷新不变慢。
 - 语言切分正则有回归断言:`python test_split.py`。
-- 已知限制:没有暂停按钮(服务端 8 秒空闲即断连,真暂停需要和重连联动,后续再做)。
+- 主持人专属暂停会关闭 ASR、持续清空音频队列;继续后立即走既有重连路径,暂停期间音频不重放。
 
 
 ## 实验功能与 UX(2026-08-07 晚)
@@ -77,6 +78,6 @@ cd CKBA/Babel/solution
 
 - 草稿留在 volc-mt(快,精简恒等术语表),节拍 0.6 秒加"2 秒内新增不足 6 字跳过"的增量阈值,QPM 预算基本全给草稿;限流进行中自动降到 2.5 秒。
 - 句子落定瞬间,只有最后一版草稿的源文覆盖最终句至少 60% 才**晋升**为临时译文(斜体 ≈ 标记);覆盖不足时让位给精翻,避免短草稿误导读者。
-- 精翻走 ark,带前两句上下文(system prompt 注入全量术语表),到位后原地覆盖临时译文。原独立的"上下文润色"第四棒删除,上下文成为精翻默认。ark 凭证缺失时回退 volc-mt。
+- 精翻走 ark,带前四组原文/已定译文(system prompt 注入全量术语表;待定时用临时译文),到位后原地覆盖临时译文。原独立的"上下文润色"第四棒删除,上下文成为精翻默认。ark 凭证缺失时回退 volc-mt。
 - 补译(15 秒一轮,最长 3 分钟)同走 ark。限流单独分类 RateLimitError,重试间隔 5s/15s。
 - 实验弹窗显示近 60 秒各通道请求数(草稿/精翻/限流)。润色开关已删。

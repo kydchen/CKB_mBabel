@@ -40,13 +40,13 @@
   .wordmark i { font-style: italic; color: var(--accent); }
   .session-meta { font-size: 13px; color: var(--ink-3); letter-spacing: .04em; }
   header nav { margin-left: auto; display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; row-gap: 5px; }
-  header nav a, header nav select { white-space: nowrap; }
-  header nav a, header nav select {
+  header nav a, header nav select, header nav button { white-space: nowrap; }
+  header nav a, header nav select, header nav button {
     font-size: 14px; color: var(--ink-2); cursor: pointer;
     background: none; border: none; border-bottom: 1px solid transparent;
     font-family: var(--sans); padding: 0; appearance: none;
   }
-  header nav a:hover, header nav select:hover { border-bottom-color: var(--ink-2); }
+  header nav a:hover, header nav select:hover, header nav button:hover { border-bottom-color: var(--ink-2); }
   header nav::-webkit-scrollbar { display: none; }
   #live-dot { font-size: 13px; color: var(--ink-3); white-space: nowrap; }
   #live-dot::before {
@@ -270,6 +270,7 @@
       <option value="xl">投屏 XL</option>
     </select>
     <a id="device-btn" title="声音设备 Audio devices" style="display:none">声音 Audio</a>
+    <button id="pause-btn" type="button" aria-pressed="false" title="暂停或恢复字幕 Pause or resume captions" style="display:none">暂停 Pause</button>
     <a id="lab-btn">实验 Lab</a>
     <a id="share-btn" style="display:none">分享 Share</a>
     <a id="info-btn">说明 About</a>
@@ -365,8 +366,8 @@
       <label for="ddc-toggle" style="margin:0"><span class="zh">口语顺滑 DDC(去嗯啊结巴,会重启识别连接约 2 秒)</span>
       <span class="en">Disfluency smoothing (DDC). Restarts the ASR session (~2s gap).</span></label>
     </div>
-    <p style="font-size:13.5px"><span class="zh">精翻默认带前两句上下文(ark),术语表照常注入;无独立润色开关。</span>
-    <span class="en">The refined pass carries sentence context by default (ark); glossary still applies. No separate polish toggle.</span><br>
+    <p style="font-size:13.5px"><span class="zh">精翻默认带前四组原文/译文上下文(ark),术语表照常注入;无独立润色开关。</span>
+    <span class="en">The refined pass carries the previous four source/translation pairs (ark); glossary still applies. No separate polish toggle.</span><br>
     <span id="stats-line" style="color:var(--ink-3)">近 60 秒请求 Requests 60s:…</span></p>
     <h3>识别纠错 ASR correction</h3>
     <p style="font-size:13.5px"><span class="zh">修的是<span class="k">语音识别听错的词</span>(原文里的错字),不是翻译。写法:错词=正确词,例:CKG=CKB。即时对后续句子生效,不回改历史;退出时存入术语表。</span>
@@ -436,7 +437,7 @@ function scrollFollow() {
 
 // ---- helpers ----
 function speakerNum(s) { const n = parseInt(s, 10); return isNaN(n) ? s : n + 1; }
-function speakerName(id) { return sessionNames[id] || ('Speaker ' + speakerNum(id)); }
+function speakerName(id) { if (id == null) return ''; return sessionNames[id] || ('Speaker ' + speakerNum(id)); }
 function spColor(id) { return SPCOLORS[(parseInt(id, 10) || 0) % SPCOLORS.length]; }
 function fmtTime(ts) {
   if (ts == null) return '';
@@ -587,6 +588,7 @@ function renderAll() {
 let wsConn = null;
 let controlToken = null;
 let devicePanelOpened = false;
+const pauseBtn = document.getElementById('pause-btn');
 function wsSend(obj) {
   if (wsConn && wsConn.readyState === 1 && controlToken) {
     wsConn.send(JSON.stringify({...obj, token: controlToken}));
@@ -606,6 +608,7 @@ function connect() {
   ws.onclose = () => {
     controlToken = null;
     document.getElementById('device-btn').style.display = 'none';
+    pauseBtn.style.display = 'none';
     setLive('reconnecting…');
     setTimeout(connect, 1500);
   };
@@ -634,9 +637,22 @@ function connect() {
     else if (ev.type === 'control_token') {
       controlToken = ev.token;
       document.getElementById('device-btn').style.display = '';
+      pauseBtn.style.display = '';
       wsSend({type: 'devices_get'});
+      wsSend({type: 'pause_get'});
     }
     else if (ev.type === 'devices') onDevices(ev);
+    else if (ev.type === 'pause_state') {
+      pauseBtn.dataset.paused = ev.paused ? '1' : '0';
+      pauseBtn.textContent = ev.paused ? '继续 Resume' : '暂停 Pause';
+      pauseBtn.setAttribute('aria-pressed', ev.paused ? 'true' : 'false');
+      if (ev.paused) {
+        hearing.textContent = '';
+        drafting.textContent = '';
+        drafting.classList.remove('on');
+      }
+      setLive(ev.paused ? 'paused' : 'resuming…');
+    }
     else if (ev.type === 'status') {
       setLive(ev.text === 'connected' ? '' : ev.text);
     }
@@ -754,6 +770,8 @@ function onDevices(ev) {
 }
 
 deviceBtn.onclick = () => openModal('device-mask');
+pauseBtn.onclick = () =>
+  wsSend({type: 'pause', paused: pauseBtn.dataset.paused !== '1'});
 micSelect.onchange = sendAudioSettings;
 systemToggle.onchange = sendAudioSettings;
 speakerSelect.onchange = sendAudioSettings;

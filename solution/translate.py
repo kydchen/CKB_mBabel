@@ -161,7 +161,19 @@ _LEAK_MARKERS = ("Wait,", "wait no", "source text", "target language",
 
 def _looks_like_reasoning(out: str) -> bool:
     hits = sum(1 for m in _LEAK_MARKERS if m in out)
-    return hits >= 2
+    return "\n" in out or hits >= 2
+
+
+def _render_context(context: list[dict]) -> str:
+    lines = []
+    for item in context:
+        source_lang = item["source_lang"]
+        target_lang = "en" if source_lang == "zh" else "zh"
+        translation = item.get("translation") or "(pending)"
+        lines.append(
+            f"- {source_lang}: {item['source']} / {target_lang}: {translation}"
+        )
+    return "\n".join(lines)
 
 
 class ArkTranslator:
@@ -200,9 +212,9 @@ class ArkTranslator:
 
     async def translate(self, text: str, source_lang: str, target_lang: str,
                         lite: bool = False,
-                        context: list[str] | None = None) -> str:
+                        context: list[dict] | None = None) -> str:
         if context:
-            ctx = "\n".join(f"- {c}" for c in context)
+            ctx = _render_context(context)
             user = (
                 f"Recent meeting context for reference only, do NOT translate it:\n"
                 f"{ctx}\n\n"

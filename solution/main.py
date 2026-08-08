@@ -44,19 +44,25 @@ def load_dotenv(path: str) -> None:
         os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
-def load_hotwords_dir(path: str) -> list[str]:
-    """Read *.txt hotword files (one entry per line, '#' comments).
-    Skips boosting_table.txt: it is a generated derivative, not a source."""
-    words: list[str] = []
+def load_hotwords_dir(path: str) -> list[tuple[str, int]]:
+    """Read hotwords with optional ``#priority high|normal|low`` sections."""
+    words: list[tuple[str, int]] = []
     if not os.path.isdir(path):
         return words
     for name in sorted(os.listdir(path)):
         if not name.endswith(".txt") or name == "boosting_table.txt":
             continue
+        priority = 1
         for line in open(os.path.join(path, name), encoding="utf-8"):
             word = line.strip()
-            if word and not word.startswith("#"):
-                words.append(word)
+            marker = re.fullmatch(r"#priority(?:\s*[:=]?\s*(high|normal|low))?",
+                                  word, re.IGNORECASE)
+            if marker:
+                priority = {"high": 2, "normal": 1, "low": 0}.get(
+                    (marker.group(1) or "high").lower(), 2
+                )
+            elif word and not word.startswith("#"):
+                words.append((word, priority))
     return words
 
 SAMPLE_RATE = 16000
@@ -82,6 +88,23 @@ def collect_reconnect_tail(sent_tail, queue: asyncio.Queue,
             chunks.append(chunk)
     tail = chunks[-keep:]
     return tail, len(chunks) - len(tail)
+
+
+def discard_queued_audio(queue: asyncio.Queue) -> int:
+    """Drop queued audio while preserving the WAV end sentinel."""
+    count = 0
+    ended = False
+    while True:
+        try:
+            chunk = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            if ended:
+                queue.put_nowait(None)
+            return count
+        if chunk is None:
+            ended = True
+        else:
+            count += 1
 
 
 def is_replay_duplicate(text: str, previous: str) -> bool:
@@ -141,6 +164,33 @@ CLEAR_LINE = "\033[2K\r"
 RESET = "\033[0m"
 
 CJK_RE = re.compile(r"[一-鿿]")
+
+
+def hotword_token_cost(word: str) -> int:
+    """Conservative ASR estimate: each CJK char and whitespace word is a token."""
+    cjk = len(CJK_RE.findall(word))
+    latin = len(CJK_RE.sub(" ", word).split())
+    return max(1, cjk + latin)
+
+
+def trim_hotwords(entries: list[tuple[str, int]], limit: int = 100
+                  ) -> tuple[list[str], list[str], int]:
+    """Keep higher-priority hotwords first without exceeding the token budget."""
+    ranked = sorted(enumerate(entries), key=lambda item: (-item[1][1], item[0]))
+    kept: list[str] = []
+    dropped: list[str] = []
+    used = 0
+    for index, (_, (word, _priority)) in enumerate(ranked):
+        cost = hotword_token_cost(word)
+        if used + cost <= limit:
+            kept.append(word)
+            used += cost
+        else:
+            dropped.extend(item[0] for _, item in ranked[index:])
+            break
+    return kept, dropped, used
+
+
 LATIN_RE = re.compile(r"[A-Za-z]")
 
 
@@ -394,6 +444,7 @@ class AudioMixer:
                           "default_input": None, "default_output": None,
                           "blackhole": None}
         self.warning = ""
+        self.paused = False
         self.on_state = None
         self.lock = asyncio.Lock()
         self.stats = {"system_underflow": 0, "system_drop": 0, "queue_drop": 0}
@@ -553,12 +604,16 @@ class AudioMixer:
         return callback
 
     def _receive_system(self, data: bytes) -> None:
+        if self.paused:
+            return
         if len(self.system_chunks) >= 2:  # 400ms ceiling at the 200ms block size
             self.system_chunks.pop(0)
             self.stats["system_drop"] += 1
         self.system_chunks.append(data)
 
     def _receive_mic(self, data: bytes) -> None:
+        if self.paused:
+            return
         if self.capture_system and self.system_stream is not None:
             if self.system_chunks:
                 data = mix_pcm_s16(data, self.system_chunks.pop(0))
@@ -750,16 +805,20 @@ async def run(args) -> None:
     glossary = Glossary.load(args.glossary)
     # Merge hotword files: English/proper nouns become identity translation
     # terms (kept as-is, e.g. "Meepo"), Chinese entries only feed ASR.
-    # ASR hotword priority: curated files first, glossary terms after, so the
-    # 100-token streaming cap truncates low-value entries, not curated ones.
-    file_words = load_hotwords_dir(args.hotwords_dir)
+    # ASR hotword priority comes from #priority sections; glossary-only terms
+    # are the lowest tier, so the 100-token cap preserves curated names.
+    file_entries = load_hotwords_dir(args.hotwords_dir)
+    file_words = [word for word, _priority in file_entries]
     sources = {t["source"] for t in glossary.terms}
     for word in file_words:
         if word not in sources:
             if not CJK_RE.search(word):
                 glossary.terms.append({"source": word, "target": word})
             sources.add(word)
-    hotwords_all = list(dict.fromkeys(file_words + [t["source"] for t in glossary.terms]))
+    priorities: dict[str, int] = {}
+    for word, priority in file_entries + [(t["source"], -1) for t in glossary.terms]:
+        priorities[word] = max(priority, priorities.get(word, -1))
+    hotwords_all = list(priorities)
 
     # Split hotwords into two channels: direct transmission (cap 100 tokens,
     # for table-incompatible entries and English proper nouns) and a
@@ -783,14 +842,17 @@ async def run(args) -> None:
             incompatible.append(w)
         else:
             table_words.append(tf)
-    direct = list(dict.fromkeys(
+    direct_candidates = list(dict.fromkeys(
         incompatible + [w for w in hotwords_all
                         if table_form(w) is not None and not CJK_RE.search(w)]
     ))
-    if len(direct) > 100:
-        print(f"[hotwords] direct list has {len(direct)} entries; "
-              f"sending the first 100, the rest ride the boosting table")
-        direct = direct[:100]
+    direct, dropped, direct_tokens = trim_hotwords(
+        [(word, priorities[word]) for word in direct_candidates]
+    )
+    if dropped:
+        print(f"[hotwords] direct budget: {direct_tokens}/100 estimated tokens "
+              f"across {len(direct)} terms; dropped {len(dropped)} terms after "
+              f"priority ordering: {', '.join(dropped)}")
     table_words = list(dict.fromkeys(table_words))
     table_path = os.path.join(args.hotwords_dir, "boosting_table.txt")
     with open(table_path, "w", encoding="utf-8") as f:
@@ -914,6 +976,9 @@ async def run(args) -> None:
     audio = (None if args.wav else AudioMixer(queue, args.audio_config))
     if audio and ui:
         audio.on_state = ui.emit_control
+    paused = {"v": False}
+    resume_event = asyncio.Event()
+    resume_event.set()
 
     async def on_control(msg: dict) -> None:
         """Control messages from the UI (token-guarded in ui_server)."""
@@ -937,6 +1002,44 @@ async def run(args) -> None:
                     await ui.emit({"type": "status",
                                    "text": f"ddc {'on' if enabled else 'off'}, ASR restarting…"})
                 await asr.close()
+        elif kind == "pause":
+            requested = bool(msg.get("paused"))
+            if requested != paused["v"]:
+                if requested:
+                    paused["v"] = True
+                    if audio:
+                        audio.paused = True
+                        audio.system_chunks.clear()
+                    resume_event.clear()
+                    # speech spoken BEFORE the pause stays on record: settle
+                    # the live line now — closing the session means its
+                    # definite re-recognition will never arrive
+                    if not line_parts and last_live_line["text"]:
+                        line_parts.append(last_live_line["text"])
+                    if line_parts:
+                        await flush_line()
+                    replay_audio.clear()
+                    sent_audio_tail.clear()
+                    reconnect_partial["text"] = ""
+                    dropped = discard_queued_audio(queue)
+                    print(f"[asr] paused; discarded {dropped} queued audio chunks")
+                    await asr.close()
+                else:
+                    dropped = discard_queued_audio(queue)
+                    if audio:
+                        audio.system_chunks.clear()
+                        audio.paused = False
+                    paused["v"] = False
+                    resume_event.set()
+                    print(f"[asr] resuming; discarded {dropped} paused audio chunks")
+                if ui:
+                    await ui.emit({"type": "status",
+                                   "text": "paused" if requested else "ASR resuming…"})
+            if ui:
+                await ui.emit_control({"type": "pause_state", "paused": paused["v"]})
+        elif kind == "pause_get":
+            if ui:
+                await ui.emit_control({"type": "pause_state", "paused": paused["v"]})
         elif kind == "stats":
             if ui:
                 await ui.emit({"type": "stats", **stats_snapshot()})
@@ -975,7 +1078,7 @@ async def run(args) -> None:
     translate_tasks: list[asyncio.Task] = []
     draft_tasks: list[asyncio.Task] = []  # cancelled on flush: finals have priority
     cache: dict[str, str] = {}
-    recent_sources: list[str] = []  # last committed originals, context for polish
+    recent_context: deque[dict] = deque(maxlen=4)
     last_committed = {"text": ""}
     last_live_line = {"text": ""}
     reconnect_partial = {"text": ""}
@@ -1046,8 +1149,10 @@ async def run(args) -> None:
                 await ui.emit({"type": "translation", "id": seg_id,
                                "text": provisional, "provisional": True})
 
-        ctx = recent_sources[-2:]
-        recent_sources.append(text)
+        ctx = [dict(item) for item in recent_context]
+        context_entry = {"seq": seg_id, "source_lang": src, "source": text,
+                         "translation": provisional or ""}
+        recent_context.append(context_entry)
         # refined pass: ark with the previous sentences as context (default
         # since W1); volc-mt stays as fallback when ark credentials are absent
         translated = None
@@ -1080,10 +1185,14 @@ async def run(args) -> None:
                 # readable line; schedule quiet backfills
                 translated = provisional or "⚠ 翻译失败 translation unavailable"
                 translate_tasks.append(
-                    asyncio.create_task(backfill(text, seg_id, src, tgt, ctx))
+                    asyncio.create_task(
+                        backfill(text, seg_id, src, tgt, ctx, context_entry)
+                    )
                 )
             else:
                 cache[text] = translated  # never cache the failure placeholder
+        if not translated.startswith("⚠ "):
+            context_entry["translation"] = translated
         if ui and translated != provisional:
             await ui.emit({"type": "translation", "id": seg_id, "text": translated})
         elif ui and provisional is None:
@@ -1099,7 +1208,7 @@ async def run(args) -> None:
         sys.stdout.flush()
 
     async def backfill(text: str, seg_id: int, src: str, tgt: str,
-                     ctx: list[str]) -> None:
+                     ctx: list[dict], context_entry: dict) -> None:
         """A failed refined translation is retried quietly every 15s for up
         to ~3 minutes, same engine as the refined pass (ark with context
         when available); on success the line updates in place."""
@@ -1114,6 +1223,7 @@ async def run(args) -> None:
             except Exception:
                 continue
             cache[text] = fixed
+            context_entry["translation"] = fixed
             if ui:
                 await ui.emit({"type": "translation", "id": seg_id, "text": fixed})
             for r in transcript_records:
@@ -1153,7 +1263,8 @@ async def run(args) -> None:
         speech rarely ends with clean sentence-final punctuation."""
         while True:
             await asyncio.sleep(0.5)
-            if line_parts and asyncio.get_running_loop().time() - last_activity["t"] > FLUSH_SILENCE_S:
+            if (not paused["v"] and line_parts
+                    and asyncio.get_running_loop().time() - last_activity["t"] > FLUSH_SILENCE_S):
                 await flush_line()
 
     watchdog = asyncio.create_task(silence_watchdog())
@@ -1182,11 +1293,23 @@ async def run(args) -> None:
             sent_audio_tail.append(chunk)
             yield chunk
 
+    async def wait_while_paused() -> None:
+        if not paused["v"]:
+            return
+        while paused["v"]:
+            discard_queued_audio(queue)
+            try:
+                await asyncio.wait_for(resume_event.wait(), 0.2)
+            except asyncio.TimeoutError:
+                pass
+        discard_queued_audio(queue)
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGHUP):
         loop.add_signal_handler(sig, run_task.cancel)
     try:
         while True:  # ASR reconnect loop: survive network blips mid-meeting
+            await wait_while_paused()
             got_last = False
             sent_audio_tail.clear()
             try:
@@ -1293,11 +1416,28 @@ async def run(args) -> None:
                 sys.exit(f"[asr] handshake rejected (HTTP {e.response.status_code}); "
                          f"check VOLC_ASR_API_KEY and service activation")
             except (AsrError, ConnectionClosedError, OSError) as e:
-                if not ever_connected:
+                if paused["v"]:
+                    pass
+                elif not ever_connected:
                     # failing before the first event (auth, params) is fatal,
                     # not a reconnect case
                     sys.exit(f"[asr] failed before any result: {e}")
-                print(f"\n[asr] connection problem: {e}", file=sys.stderr)
+                else:
+                    print(f"\n[asr] connection problem: {e}", file=sys.stderr)
+            if paused["v"]:
+                for task in draft_tasks:
+                    task.cancel()
+                draft_tasks.clear()
+                line_parts.clear()
+                last_live_line["text"] = ""
+                reconnect_partial["text"] = ""
+                last_draft.update(text="")
+                last_draft_result.update(text="", source="", src="", time=0.0)
+                replay_audio.clear()
+                sent_audio_tail.clear()
+                committed.clear()
+                announced_connected = False
+                continue
             if got_last and args.wav:
                 break
             reconnects += 1

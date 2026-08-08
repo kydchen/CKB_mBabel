@@ -25,7 +25,7 @@
 ## 架构
 
 ```
-麦克风/系统声音(macOS: BlackHole + 聚合设备)
+麦克风/系统声音(macOS: BlackHole + 软件混音)
   → 火山 Seed-ASR 2.0(流式、二遍识别、热词、说话人聚类)
   → 句子累积器(语言边界切分、静音看门狗)
   → 快速草稿:火山机器翻译(matx_translate,原生术语表)
@@ -67,21 +67,21 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # PyPI 慢加镜像 -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
+macOS 可选安装:双击一次 `install-app.command`,会按当前克隆路径在
+`/Applications`(无权限时 `~/Applications`)生成本机专属 `mBabel.app`。
+
 ### 3. 音频路由(macOS)
 
 - 线下会议:无需配置,直接用 MacBook 麦克风。
 - 线上会议(Zoom/Teams/Meet):`brew install blackhole-2ch`,在音频 MIDI 设置里建:
   - **多输出设备**:扬声器 + BlackHole 2ch(你听得到,Babel 拿一份);
-  - **聚合设备**:BlackHole 2ch + 你的麦克风(远端声音加你自己的声音)。
+  - 不要建聚合设备:Babel 会分别打开麦克风和 BlackHole,在软件内混音。
 - 会议软件输出选多输出设备。
 
 ### 4. 运行
 
 ```bash
 cd solution
-.venv/bin/python main.py --list-devices                       # 查设备序号
-.venv/bin/python main.py --device <聚合设备序号> --channels 4
-# 或者直接用默认麦克风:
 .venv/bin/python main.py
 ```
 
@@ -94,11 +94,11 @@ cd solution
 - `--wav test.wav`:用 16kHz 单声道 WAV 回放测试(仓库自带样例)。
 - `--no-ui`:只用终端输出。
 
-双击启动:编辑 `Babel.command` 里的设备序号后,Finder 双击即可。
+双击 `mBabel.app`(完成上面的可选安装后)或 `Babel.command` 即可启动;麦克风和系统声音在主持人页面的声音面板里选择。
 
 ## 领域适配
 
-- `hotwords/hotwords.txt`、`hotwords/hotwords_zh.txt`:ASR 热词,每行一个。英文专名同时作为恒等术语进翻译侧(原样保留)。
+- `hotwords/hotwords.txt`、`hotwords/hotwords_zh.txt`:ASR 热词,每行一个;`#priority high|normal|low` 开始一个优先级分段,直传 100 token 超限时先裁低优先级词。英文专名同时作为恒等术语进翻译侧(原样保留)。
 - `solution/glossary.json`:`terms` 是中英术语对(英译中译值建议用"Fiber网络"这种中英混合形态;匹配大小写敏感,程序自动生成变体);`corrections` 是识别纠错映射。
 - `hotwords/boosting_table.txt`:每次启动重新生成(平台规则:小于 10 字、无标点、数字写汉字),词表变更后重新上传。
 
@@ -108,7 +108,7 @@ cd solution
 
 - 说话人标签是聚类编号(说话人 1/2/…),会议内稳定,不是实名。
 - 音频经云端处理,有全离线需求的场合这套方案不适用。
-- 暂无暂停按钮:服务端约 8 秒空闲即断连,真暂停需要与重连逻辑联动(已规划)。
+- 主持人专属的暂停按钮会主动断开 ASR 并丢弃暂停期间的音频;继续时走已有重连路径。
 - 转录自动保存在 `solution/transcripts/`(运行时创建,不入库)。
 - 在 macOS(Apple Silicon)上实测;音频采集层理论跨平台,路由说明是 macOS 专属。
 
