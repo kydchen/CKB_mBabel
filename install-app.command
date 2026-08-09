@@ -32,17 +32,29 @@ if [[ -f "$icon_png" ]]; then
       || icon_ok=0
   done
   { (( icon_ok )) \
-      && iconutil -c icns "$iconset" -o "$tmp_dir/mBabel.app/Contents/Resources/applet.icns"; } \
+      && iconutil -c icns "$iconset" -o "$tmp_dir/mBabel.app/Contents/Resources/applet.icns" \
+      && rm -f "$tmp_dir/mBabel.app/Contents/Resources/Assets.car" \
+      && { /usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" \
+             "$tmp_dir/mBabel.app/Contents/Info.plist" 2>/dev/null || true; }; } \
     || print -u2 "warning: could not build the app icon; keeping the default"
+  # IconServices prefers the asset catalog over CFBundleIconFile, so the
+  # template's Assets.car/CFBundleIconName must go for applet.icns to win.
+  # Editing the bundle breaks osacompile's seal: re-seal ad hoc.
+  codesign --force --sign - "$tmp_dir/mBabel.app" 2>/dev/null \
+    || print -u2 "warning: could not re-sign the app"
 fi
 
+# ditto merges into an existing bundle and would leave stale template
+# files (e.g. Assets.car) behind: replace the old install outright.
 install_dir=/Applications
 if [[ -d "$install_dir" && -w "$install_dir" ]] \
+    && rm -rf "$install_dir/mBabel.app" \
     && /usr/bin/ditto "$tmp_dir/mBabel.app" "$install_dir/mBabel.app"; then
   :
 else
   install_dir="$HOME/Applications"
   mkdir -p "$install_dir"
+  rm -rf "$install_dir/mBabel.app"
   /usr/bin/ditto "$tmp_dir/mBabel.app" "$install_dir/mBabel.app"
 fi
 touch "$install_dir/mBabel.app"  # nudge Finder/LaunchServices to refresh the icon
