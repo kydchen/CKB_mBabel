@@ -69,7 +69,8 @@ python3 -m venv .venv
 ```
 
 Optional macOS app: double-click `install-app.command` once. It builds a local
-`mBabel.app` for this clone in `/Applications` (or `~/Applications`).
+`mBabel.app` for this clone in `/Applications` (or `~/Applications`), with the
+mBabel icon applied automatically (from `assets/icon.png`, stock macOS tools only).
 
 ### 3. Audio routing (macOS)
 

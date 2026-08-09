@@ -69,7 +69,8 @@ python3 -m venv .venv
 ```
 
 macOS 可选安装:双击一次 `install-app.command`,会按当前克隆路径在
-`/Applications`(无权限时 `~/Applications`)生成本机专属 `mBabel.app`。
+`/Applications`(无权限时 `~/Applications`)生成本机专属 `mBabel.app`,
+并自动带上 mBabel 图标(来自 `assets/icon.png`,只用 macOS 自带工具生成)。
 
 ### 3. 音频路由(macOS)
 

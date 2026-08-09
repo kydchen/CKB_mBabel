@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Source of assets/icon.png (1024x1024, transparent corners). Regenerate with:
+     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless \
+       --screenshot=icon.png --window-size=1024,1024 \
+       --default-background-color=00000000 --hide-scrollbars file://$PWD/icon.html -->
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body { width: 1024px; height: 1024px; position: relative; }
+  /* Apple icon grid: 824px rounded rect centered on a 1024 canvas */
+  .plate {
+    position: absolute; left: 100px; top: 100px; width: 824px; height: 824px;
+    border-radius: 186px;
+    background: linear-gradient(180deg, #FBF9F3 0%, #F3EFE4 100%);
+    box-shadow: inset 0 0 0 3px #E7E1D3, 0 14px 36px rgba(33,31,26,.28);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .mark {
+    font-family: "Charter", Georgia, serif;
+    font-weight: 700; font-size: 390px; line-height: 1;
+    letter-spacing: -0.02em;
+    color: #211F1A;
+    transform: translateY(-16px);
+  }
+  .mark i { font-style: italic; color: #B3442A; }
+</style>
+<body>
+  <div class="plate">
+    <span class="mark">m<i>B</i></span>
+  </div>
+</body>
+</html>

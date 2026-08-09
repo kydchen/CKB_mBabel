@@ -19,6 +19,23 @@ osacompile -o "$tmp_dir/mBabel.app" \
   -e 'end tell' \
   -e 'end run'
 
+# App icon: build applet.icns from the repo master with stock macOS tools.
+# Cosmetic — a failure here must not abort the install.
+icon_png="$repo_dir/assets/icon.png"
+if [[ -f "$icon_png" ]]; then
+  iconset="$tmp_dir/mBabel.iconset"
+  mkdir "$iconset"
+  icon_ok=1
+  for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$icon_png" --out "$iconset/icon_${size}x${size}.png" >/dev/null \
+      && sips -z $((size * 2)) $((size * 2)) "$icon_png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null \
+      || icon_ok=0
+  done
+  { (( icon_ok )) \
+      && iconutil -c icns "$iconset" -o "$tmp_dir/mBabel.app/Contents/Resources/applet.icns"; } \
+    || print -u2 "warning: could not build the app icon; keeping the default"
+fi
+
 install_dir=/Applications
 if [[ -d "$install_dir" && -w "$install_dir" ]] \
     && /usr/bin/ditto "$tmp_dir/mBabel.app" "$install_dir/mBabel.app"; then
@@ -28,4 +45,5 @@ else
   mkdir -p "$install_dir"
   /usr/bin/ditto "$tmp_dir/mBabel.app" "$install_dir/mBabel.app"
 fi
+touch "$install_dir/mBabel.app"  # nudge Finder/LaunchServices to refresh the icon
 print "Installed $install_dir/mBabel.app"
