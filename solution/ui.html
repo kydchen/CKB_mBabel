@@ -730,7 +730,7 @@ function connect() {
     document.getElementById('device-btn').style.display = 'none';
     pauseBtn.style.display = 'none';
     setLive('reconnecting…');
-    setTimeout(connect, 1500);
+    setTimeout(connect, 1500 + (Math.random() - 0.5) * 1000);
   };
   ws.onmessage = (m) => {
     const ev = JSON.parse(m.data);

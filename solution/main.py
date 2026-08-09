@@ -212,6 +212,14 @@ def collect_reconnect_tail(sent_tail, queue: asyncio.Queue,
     return tail, len(chunks) - len(tail)
 
 
+def prune_done_tasks(tasks: list[asyncio.Task]) -> None:
+    """Drop completed task references without losing pending work."""
+    for task in tasks:
+        if task.done() and not task.cancelled():
+            task.exception()  # retrieve failures before releasing the reference
+    tasks[:] = [task for task in tasks if not task.done()]
+
+
 def discard_queued_audio(queue: asyncio.Queue) -> int:
     """Drop queued audio while preserving the WAV end sentinel."""
     count = 0
@@ -1558,7 +1566,9 @@ async def run(args) -> None:
         # refined pass: ark with the previous sentences as context (default
         # since W1); volc-mt stays as fallback when ark credentials are absent
         translated = None
-        if text in cache:
+        if provisional is not None and hotword_token_cost(text) <= 6:
+            translated = provisional
+        elif text in cache:
             translated = cache[text]
         else:
             engine = ark_polisher if ark_polisher is not None else translator
@@ -1665,6 +1675,7 @@ async def run(args) -> None:
         speech rarely ends with clean sentence-final punctuation."""
         while True:
             await asyncio.sleep(0.5)
+            prune_done_tasks(translate_tasks)
             if (not paused["v"] and line_parts
                     and asyncio.get_running_loop().time() - last_activity["t"] > FLUSH_SILENCE_S):
                 await flush_line()

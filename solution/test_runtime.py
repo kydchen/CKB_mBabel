@@ -106,6 +106,35 @@ class DraftCoverageAsr(DummyAsr):
         )
 
 
+class ShortSentenceAsr(DummyAsr):
+    async def transcribe(self, chunks):
+        yield SimpleNamespace(text="你好朋友", utterances=[], is_last=False)
+        await asyncio.sleep(0.05)
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "你好朋友。",
+                "start_time": 0,
+                "end_time": 100,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
+            is_last=False,
+        )
+        await asyncio.sleep(0.05)
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "收到。",
+                "start_time": 101,
+                "end_time": 200,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
+            is_last=True,
+        )
+
+
 class CommittedWithResidualAsr(DummyAsr):
     async def transcribe(self, chunks):
         yield SimpleNamespace(
@@ -627,6 +656,34 @@ async def draft_promotion_check(temp_dir):
     assert provisional_ids == [2], provisional_ids
 
 
+async def short_sentence_refine_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    DummyTranslator.calls.clear()
+    DummyUI.events.clear()
+    with patch.object(babel, "VolcAsrClient", ShortSentenceAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True):
+        await babel.run(args)
+    refined = [text for text, kwargs in DummyTranslator.calls
+               if not kwargs.get("lite")]
+    assert refined == ["收到。"], refined
+    provisional = [event["id"] for event in DummyUI.events
+                   if event.get("provisional")]
+    assert provisional == [1], provisional
+
+
+async def translate_task_pruning_check():
+    done = asyncio.create_task(asyncio.sleep(0))
+    pending = asyncio.create_task(asyncio.Event().wait())
+    await done
+    tasks = [done, pending]
+    babel.prune_done_tasks(tasks)
+    assert tasks == [pending] and not pending.done(), tasks
+    pending.cancel()
+    await asyncio.gather(pending, return_exceptions=True)
+
+
 async def committed_draft_clear_check(temp_dir):
     args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
     args.no_ui = False
@@ -757,6 +814,8 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(audio_mixer_check(temp_dir))
         asyncio.run(draft_reset_check(temp_dir))
         asyncio.run(draft_promotion_check(temp_dir))
+        asyncio.run(short_sentence_refine_check(temp_dir))
+        asyncio.run(translate_task_pruning_check())
         asyncio.run(committed_draft_clear_check(temp_dir))
         asyncio.run(context_check(temp_dir))
         asyncio.run(pause_check(temp_dir))
