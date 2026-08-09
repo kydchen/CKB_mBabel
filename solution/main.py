@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import difflib
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import time
 import wave
 import webbrowser
 from collections import deque
+from urllib.parse import urlsplit
 
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
@@ -88,6 +90,111 @@ REPLAY_GUARD_SECONDS = 10.0
 REPLAY_GUARD_FRAGMENTS = 5
 CLAUSE_FLUSH_CHARS = 80
 CLAUSE_ENDINGS = ("，", "、", "；", ",", ";")
+SESSION_DIR = os.path.join(os.path.expanduser("~"), ".mbabel")
+
+
+def session_file_path(port: int) -> str:
+    return os.path.join(SESSION_DIR, f"session-{port}.json")
+
+
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def session_http_alive(url: str, port: int) -> bool:
+    """Probe only this port's loopback page; registry contents never select a host."""
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+                or parsed.port != port):
+            return False
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+        try:
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            conn.request("GET", path)
+            response = conn.getresponse()
+            response.read()
+            return response.status == 200
+        finally:
+            conn.close()
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+def clear_session_file(port: int, expected_pid: int | None = None) -> None:
+    path = session_file_path(port)
+    if expected_pid is not None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                if json.load(f).get("pid") != expected_pid:
+                    return
+        except (OSError, TypeError, ValueError, AttributeError):
+            return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def register_session(port: int, url: str) -> str:
+    os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
+    path = session_file_path(port)
+    temp_path = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "port": port, "url": url,
+                       "started_at": time.time()}, f)
+        os.replace(temp_path, path)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def live_session(port: int) -> dict | None:
+    path = session_file_path(port)
+    try:
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+        pid = record.get("pid")
+        if (not isinstance(pid, int) or record.get("port") != port
+                or not isinstance(record.get("url"), str)):
+            clear_session_file(port)
+            return None
+    except (OSError, TypeError, ValueError, AttributeError):
+        clear_session_file(port)
+        return None
+    if process_alive(pid) and session_http_alive(record["url"], port):
+        return record
+    clear_session_file(port, expected_pid=pid)
+    return None
+
+
+def reopen_existing_session(port: int) -> bool:
+    record = live_session(port)
+    if not record:
+        return False
+    url = record["url"]
+    print(f"[ui] 已有会话正在进行，正在打开字幕页。\n"
+          f"[ui] A session is already running; reopening captions: {url}")
+    try:
+        if not webbrowser.open(url):
+            print(f"[ui] 浏览器未响应，请手动打开 / Browser did not respond; open: {url}")
+    except OSError as e:
+        print(f"[ui] 无法打开浏览器，请手动打开 / Cannot open browser; open {url}: {e}")
+    return True
 
 
 def collect_reconnect_tail(sent_tail, queue: asyncio.Queue,
@@ -1077,6 +1184,9 @@ async def maybe_tunnel(port: int):
 
 
 async def run(args) -> None:
+    if not args.no_ui and reopen_existing_session(args.port):
+        return
+
     glossary = Glossary.load(args.glossary)
     # Merge hotword files: English/proper nouns become identity translation
     # terms (kept as-is, e.g. "Meepo"), Chinese entries only feed ASR.
@@ -1175,6 +1285,7 @@ async def run(args) -> None:
     ui: CaptionUI | None = None
     tunnel_proc = None
     share_task: asyncio.Task | None = None
+    session_registered = False
     if not args.no_ui:
         # with --share the page is served only under a random token path
         share_token = secrets.token_urlsafe(6) if args.share else None
@@ -1183,34 +1294,50 @@ async def run(args) -> None:
                        port=args.port, token=share_token)
         try:
             await ui.start()
-            url = f"http://127.0.0.1:{ui.port}{suffix}"
-            print(f"[ui] captions at {url}")
-            print(f"[control] Lab token: {ui.control_token} "
-                  f"(the local page receives it automatically; never shared)")
-            if args.share:
-                lan_url = f"http://{lan_ip()}:{ui.port}{suffix}"
-                print(f"[share] LAN link: {lan_url}")
-                await ui.set_share(lan_url, None)
+        except OSError as e:
+            if reopen_existing_session(args.port):
+                return
+            raise SystemExit(
+                f"[ui] 字幕端口 {args.port} 已被占用，mBabel 未启动。\n"
+                f"[ui] Caption port {args.port} is unavailable; mBabel did not "
+                f"start. Use --port to choose another port. ({e})"
+            ) from e
+        url = f"http://127.0.0.1:{ui.port}{suffix}"
+        try:
+            register_session(ui.port, url)
+            session_registered = True
+        except OSError as e:
+            raise SystemExit(
+                f"[ui] 无法登记当前会话，mBabel 未启动。\n"
+                f"[ui] Cannot register this session; mBabel did not start. ({e})"
+            ) from e
+        print(f"[ui] captions at {url}")
+        print(f"[control] Lab token: {ui.control_token} "
+              f"(the local page receives it automatically; never shared)")
+        if args.share:
+            lan_url = f"http://{lan_ip()}:{ui.port}{suffix}"
+            print(f"[share] LAN link: {lan_url}")
+            await ui.set_share(lan_url, None)
 
-                async def _tunnel_later() -> None:
-                    # cloudflared can take >10s to hand out a URL; never block
-                    # startup or the ASR connection on it
-                    nonlocal tunnel_proc
-                    proc, public_url = await maybe_tunnel(ui.port)
-                    tunnel_proc = proc
-                    if public_url:
-                        public_url = public_url + suffix
-                        print(f"[share] public link: {public_url}  (cloudflared quick tunnel)")
-                        if ui:
-                            await ui.set_share(lan_url, public_url)
-                    else:
-                        print("[share] no public link (cloudflared unavailable or timed out)")
+            async def _tunnel_later() -> None:
+                # cloudflared can take >10s to hand out a URL; never block
+                # startup or the ASR connection on it
+                nonlocal tunnel_proc
+                proc, public_url = await maybe_tunnel(ui.port)
+                tunnel_proc = proc
+                if public_url:
+                    public_url = public_url + suffix
+                    print(f"[share] public link: {public_url}  (cloudflared quick tunnel)")
+                    if ui:
+                        await ui.set_share(lan_url, public_url)
+                else:
+                    print("[share] no public link (cloudflared unavailable or timed out)")
 
-                share_task = asyncio.create_task(_tunnel_later())
+            share_task = asyncio.create_task(_tunnel_later())
+        try:
             webbrowser.open(url)
         except OSError as e:
-            print(f"[ui] cannot start caption UI ({e}); continuing without it")
-            ui = None
+            print(f"[ui] cannot open browser; open {url} manually ({e})")
     asr_key = os.environ.get("VOLC_ASR_API_KEY")
     app_key = os.environ.get("VOLC_ASR_APP_KEY")
     access_key = os.environ.get("VOLC_ASR_ACCESS_KEY")
@@ -1801,6 +1928,8 @@ async def run(args) -> None:
                 os.path.join(transcript_dir, "usage.jsonl"),
                 {"stamp": stamp, **usage_report},
             )
+        if session_registered:
+            clear_session_file(args.port, expected_pid=os.getpid())
         print_safe()
     if audio_failure["error"] is not None:
         raise SystemExit(f"[audio] input failed: {audio_failure['error']}")
@@ -1844,7 +1973,13 @@ def main() -> None:
     if args.audio_config == audio_config:
         migrate_audio_config(audio_config)
     load_dotenv(args.env)
-    asyncio.run(run(args))
+    try:
+        asyncio.run(run(args))
+    finally:
+        # Also covers setup failures after the UI binds but before the main
+        # transcript-cleanup block is entered. PID matching cannot remove a
+        # different live instance's registration.
+        clear_session_file(args.port, expected_pid=os.getpid())
 
 
 if __name__ == "__main__":

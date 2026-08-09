@@ -261,6 +261,11 @@ class DummyUI:
         pass
 
 
+class BindFailUI(DummyUI):
+    async def start(self):
+        raise OSError(48, "Address already in use")
+
+
 def make_args(temp_dir, wav):
     return SimpleNamespace(
         wav=wav,
@@ -277,15 +282,163 @@ def make_args(temp_dir, wav):
 
 
 async def signal_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
     asyncio.get_running_loop().call_later(
         0.2, os.kill, os.getpid(), signal.SIGTERM
     )
-    await babel.run(make_args(temp_dir, os.path.join(SOLUTION, "test.wav")))
+    with patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True):
+        await babel.run(args)
+    assert not os.path.exists(babel.session_file_path(args.port))
     transcript_dir = os.path.join(temp_dir, "transcripts")
     markdown = [name for name in os.listdir(transcript_dir) if name.endswith(".md")]
     assert len(markdown) == 1, markdown
     with open(os.path.join(transcript_dir, markdown[0]), encoding="utf-8") as f:
         assert "测试句。" in f.read()
+
+
+def write_test_session(port, pid, url):
+    os.makedirs(babel.SESSION_DIR, exist_ok=True)
+    path = babel.session_file_path(port)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"pid": pid, "port": port, "url": url,
+                   "started_at": time.time()}, f)
+    os.chmod(path, 0o600)
+    return path
+
+
+def session_registry_check():
+    port = 18765
+    url = f"http://127.0.0.1:{port}/secret"
+    path = babel.register_session(port, url)
+    with open(path, encoding="utf-8") as f:
+        record = json.load(f)
+    assert record["pid"] == os.getpid() and record["port"] == port
+    assert record["url"] == url and isinstance(record["started_at"], float)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    with patch.object(babel, "process_alive", return_value=True), \
+         patch.object(babel, "session_http_alive", return_value=True), \
+         patch.object(babel.webbrowser, "open", return_value=True) as opened:
+        assert babel.reopen_existing_session(port)
+        opened.assert_called_once_with(url)
+    assert not babel.reopen_existing_session(port + 1)
+    assert os.path.exists(path)  # another port never touches this registration
+
+    write_test_session(port, 99999999, url)
+    with patch.object(babel, "process_alive", return_value=False), \
+         patch.object(babel, "session_http_alive",
+                      side_effect=AssertionError("dead pid must short-circuit HTTP")):
+        assert babel.live_session(port) is None
+    assert not os.path.exists(path)
+
+    babel.register_session(port, url)
+    with patch.object(babel, "process_alive", return_value=True), \
+         patch.object(babel, "session_http_alive", return_value=False):
+        assert babel.live_session(port) is None
+    assert not os.path.exists(path)
+    assert not babel.session_http_alive(f"http://example.com:{port}/secret", port)
+
+
+async def session_reopen_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    url = f"http://127.0.0.1:{args.port}/existing-token"
+    path = write_test_session(args.port, 4242, url)
+    output = io.StringIO()
+    with patch.object(babel, "process_alive", return_value=True), \
+         patch.object(babel, "session_http_alive", return_value=True), \
+         patch.object(babel.webbrowser, "open", return_value=True) as opened, \
+         patch.object(babel.Glossary, "load",
+                      side_effect=AssertionError("second pipeline started")), \
+         redirect_stdout(output):
+        await babel.run(args)
+    opened.assert_called_once_with(url)
+    assert "已有会话正在进行" in output.getvalue()
+    assert os.path.exists(path)
+    babel.clear_session_file(args.port)
+
+
+async def no_ui_bypass_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    path = write_test_session(
+        args.port, 4242, f"http://127.0.0.1:{args.port}/existing-token"
+    )
+    with patch.object(
+        babel, "reopen_existing_session",
+        side_effect=AssertionError("--no-ui consulted the UI session registry"),
+    ), patch.object(
+        babel, "VolcAsrClient", side_effect=RuntimeError("no-ui pipeline reached")
+    ):
+        try:
+            await babel.run(args)
+        except RuntimeError as e:
+            assert str(e) == "no-ui pipeline reached"
+        else:
+            raise AssertionError("--no-ui did not continue to its own pipeline")
+    assert os.path.exists(path)
+    babel.clear_session_file(args.port)
+
+
+async def bind_failure_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    args.port = 18767
+    output = io.StringIO()
+    with patch.object(babel, "CaptionUI", BindFailUI), redirect_stdout(output):
+        try:
+            await babel.run(args)
+        except SystemExit as e:
+            assert "mBabel did not start" in str(e) and str(args.port) in str(e)
+        else:
+            raise AssertionError("external port occupancy did not exit")
+    assert "continuing without it" not in output.getvalue()
+
+
+async def bind_race_reopen_check(temp_dir):
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    args.port = 18768
+    url = f"http://127.0.0.1:{args.port}/raced-token"
+
+    class RacingUI(DummyUI):
+        async def start(self):
+            write_test_session(self.port, 4242, url)
+            raise OSError(48, "Address already in use")
+
+    with patch.object(babel, "CaptionUI", RacingUI), \
+         patch.object(babel, "process_alive", return_value=True), \
+         patch.object(babel, "session_http_alive", return_value=True), \
+         patch.object(babel.webbrowser, "open", return_value=True) as opened, \
+         patch.object(babel, "VolcAsrClient",
+                      side_effect=AssertionError("second ASR pipeline started")):
+        await babel.run(args)
+    opened.assert_called_once_with(url)
+    babel.clear_session_file(args.port)
+
+
+async def different_port_lifecycle_check(temp_dir):
+    existing_port = 18769
+    existing_url = f"http://127.0.0.1:{existing_port}/first-token"
+    existing_path = write_test_session(existing_port, 4242, existing_url)
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    args.port = existing_port + 1
+    observed = {}
+
+    def browser_open(url):
+        with open(babel.session_file_path(args.port), encoding="utf-8") as f:
+            observed.update(json.load(f))
+        return True
+
+    with patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel, "VolcAsrClient", HotwordAsr), \
+         patch.object(babel.webbrowser, "open", side_effect=browser_open):
+        await babel.run(args)
+    assert observed["port"] == args.port and observed["url"].endswith(f":{args.port}")
+    assert not os.path.exists(babel.session_file_path(args.port))
+    assert os.path.exists(existing_path)
+    babel.clear_session_file(existing_port)
 
 
 async def audio_failure_check(temp_dir):
@@ -587,8 +740,15 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
     os.environ["VOLC_ASR_API_KEY"] = "offline-test"
     with patch.object(babel, "build_translator", return_value=DummyTranslator()), \
          patch.object(babel, "ArkTranslator", return_value=DummyTranslator()), \
-         patch.object(babel, "VolcAsrClient", DummyAsr):
+         patch.object(babel, "VolcAsrClient", DummyAsr), \
+         patch.object(babel, "SESSION_DIR", os.path.join(temp_dir, ".mbabel")):
         started = time.monotonic()
+        session_registry_check()
+        asyncio.run(session_reopen_check(temp_dir))
+        asyncio.run(no_ui_bypass_check(temp_dir))
+        asyncio.run(bind_failure_check(temp_dir))
+        asyncio.run(bind_race_reopen_check(temp_dir))
+        asyncio.run(different_port_lifecycle_check(temp_dir))
         asyncio.run(signal_check(temp_dir))
         asyncio.run(audio_failure_check(temp_dir))
         asyncio.run(wav_failure_check(temp_dir))
@@ -604,4 +764,4 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(reconnect_check(temp_dir))
         assert time.monotonic() - started < 5
 
-print("runtime: drafts, context, pause, signals, mixer fallback, and reconnect pass")
+print("runtime: sessions, drafts, context, pause, signals, mixer fallback, and reconnect pass")
