@@ -85,12 +85,21 @@
   .turn.hl { background: var(--accent-soft); }
   .who { text-align: right; padding-top: 3px; }
   .who .name {
+    min-height: 32px; display: inline-flex; align-items: center; justify-content: flex-end;
     font-family: var(--serif); font-size: 13.5px; font-weight: 600; letter-spacing: .03em;
+    cursor: pointer;
   }
+  .who .name:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
   .who .name::before {
     content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
     margin-right: 7px; vertical-align: 2px; background: var(--spc, var(--ink-3));
   }
+  .who .rename-input {
+    width: 8rem; min-height: 32px; background: var(--strip); color: var(--ink);
+    border: 1px solid var(--hair); border-radius: 6px; padding: 5px 8px;
+    font-family: var(--serif); font-size: 13.5px; font-weight: 600;
+  }
+  .who .rename-input:focus { outline: none; border-color: var(--accent); }
   .who time { display: block; font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; margin-top: 3px; }
   .orig  { font-size: var(--fs-orig); line-height: 1.65; color: var(--ink-2); margin-bottom: 6px; }
   .misrec-tag {
@@ -226,6 +235,12 @@
     font-size: 13px; color: var(--ink); background: var(--strip); border: 1px solid var(--hair);
     border-radius: 6px; padding: 4px 12px; cursor: pointer;
   }
+  #pool-toggle { min-height: 32px; margin-top: 4px; }
+  #pool-manager { margin-top: 8px; }
+  #pool-manager[hidden] { display: none; }
+  #pool-manager .spk-row input { margin-top: 0; }
+  #pool-manager .spk-row .hbtn { flex: none; min-height: 32px; }
+  .pool-note, .pool-empty { color: var(--ink-3); font-size: 13px; }
   #export-go {
     margin-top: 14px; width: 100%; padding: 8px; font-size: 15px; font-weight: 600;
     background: var(--accent); color: var(--paper); border: none; border-radius: 8px; cursor: pointer;
@@ -259,6 +274,7 @@
     header nav a, header nav select { font-size: 13px; }
     .turn { grid-template-columns: 1fr; gap: 2px; padding-left: 10px; padding-right: 2px; }
     .who { text-align: left; display: flex; gap: 10px; align-items: baseline; }
+    .who .name { justify-content: flex-start; }
     .script { padding: 18px 16px 28px; }
     .live .inner {
       grid-template-columns: 2.8rem 1fr; gap: 5px .6rem;
@@ -416,6 +432,12 @@
     <div id="spk-inputs"><p style="color:var(--ink-3)">本次会议还没有识别到说话人。No speakers detected yet.</p></div>
     <p class="zh" style="color:var(--ink-3);font-size:13px">输过的名字会记在本机浏览器,下次点输入框直接下拉选择;不会按编号自动填,因为编号和人不绑定。命名后页面上的 Speaker 标签也会换成名字。</p>
     <p class="en" style="color:var(--ink-3);font-size:13px">Typed names are remembered locally for quick selection and update the speaker labels on the page. Names are never auto-assigned to a cluster number.</p>
+    <button class="hbtn" id="pool-toggle" type="button" aria-expanded="false" aria-controls="pool-manager"><span class="zh">管理名单</span><span class="en">Manage names</span></button>
+    <div id="pool-manager" hidden>
+      <p class="pool-note zh">删除只会移除下次可选的名字,不会改写本场字幕。</p>
+      <p class="pool-note en">Deleting a saved name only removes the suggestion; it does not change this meeting.</p>
+      <div id="pool-rows"></div>
+    </div>
     <button id="export-go">下载 .md Download</button>
   </div>
 </div>
@@ -550,6 +572,39 @@ function markLatest(turn) {
   if (turn) turn.classList.add('latest');
 }
 
+function beginSpeakerRename(label, id) {
+  if (id == null || !label.isConnected) return;
+  refreshNameDatalist();
+  const initialName = speakerName(id);
+  const wasNamed = Object.hasOwn(sessionNames, id);
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'rename-input';
+  input.value = initialName;
+  input.setAttribute('list', 'spk-pool');
+  input.setAttribute('aria-label', `Rename ${initialName}`);
+  label.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    if (save) {
+      if (wasNamed || input.value.trim() !== initialName) setSessionName(id, input.value);
+      renderAll();
+    } else {
+      input.replaceWith(label);
+      label.focus();
+    }
+  };
+  input.onblur = () => finish(true);
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  };
+}
+
 function makeTurn(ev) {
   const turn = document.createElement('div');
   turn.className = 'turn';
@@ -563,6 +618,18 @@ function makeTurn(ev) {
   const name = document.createElement('span');
   name.className = 'name';
   name.textContent = speakerName(ev.speaker);
+  if (ev.speaker != null) {
+    name.tabIndex = 0;
+    name.setAttribute('role', 'button');
+    name.title = '点击改名 Click to rename';
+    name.onclick = () => beginSpeakerRename(name, ev.speaker);
+    name.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        beginSpeakerRename(name, ev.speaker);
+      }
+    };
+  }
   const time = document.createElement('time');
   time.textContent = fmtTime(ev.ts);
   who.append(name, time);
@@ -852,8 +919,100 @@ document.getElementById('corr-go').onclick = () => {
 
 // ---- export ----
 function namePool() {
-  try { return JSON.parse(localStorage.getItem('babel_spk_pool') || '[]'); }
+  try {
+    const saved = JSON.parse(localStorage.getItem('babel_spk_pool') || '[]');
+    return Array.isArray(saved)
+      ? [...new Set(saved.filter(n => typeof n === 'string').map(n => n.trim()).filter(Boolean))]
+      : [];
+  }
   catch { return []; }
+}
+
+function refreshNameDatalist(pool = namePool()) {
+  let datalist = document.getElementById('spk-pool');
+  if (!datalist) {
+    datalist = document.createElement('datalist');
+    datalist.id = 'spk-pool';
+    document.body.appendChild(datalist);
+  }
+  datalist.textContent = '';
+  for (const n of pool) {
+    const opt = document.createElement('option');
+    opt.value = n;
+    datalist.appendChild(opt);
+  }
+}
+
+function saveNamePool(names) {
+  const pool = [...new Set(names.map(n => n.trim()).filter(Boolean))];
+  localStorage.setItem('babel_spk_pool', JSON.stringify(pool));
+  refreshNameDatalist(pool);
+  return pool;
+}
+
+function setSessionName(id, rawName) {
+  const name = rawName.trim();
+  const changed = (sessionNames[id] || '') !== name;
+  if (name) {
+    sessionNames[id] = name;
+    if (changed) {
+      const pool = namePool();
+      if (!pool.includes(name)) saveNamePool([...pool, name]);
+    }
+  } else {
+    delete sessionNames[id];
+  }
+  return changed;
+}
+
+function renderNamePoolManager() {
+  const box = document.getElementById('pool-rows');
+  const pool = namePool();
+  box.textContent = '';
+  if (!pool.length) {
+    box.innerHTML = '<p class="pool-empty"><span class="zh">还没有保存过名字</span><span class="en">No saved names yet</span></p>';
+    return;
+  }
+  for (const oldName of pool) {
+    const row = document.createElement('div');
+    row.className = 'spk-row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = oldName;
+    input.setAttribute('aria-label', `Edit saved name ${oldName}`);
+    let currentName = oldName;
+    const rename = () => {
+      const newName = input.value.trim();
+      if (!newName || newName === currentName) { input.value = currentName; return; }
+      saveNamePool(namePool().map(n => n === currentName ? newName : n));
+      let changed = false;
+      for (const id of Object.keys(sessionNames)) {
+        if (sessionNames[id] !== currentName) continue;
+        sessionNames[id] = newName;
+        const field = document.querySelector(`#spk-inputs input[data-spk="${CSS.escape(id)}"]`);
+        if (field) field.value = newName;
+        changed = true;
+      }
+      currentName = newName;
+      input.value = newName;
+      if (changed) renderAll();
+    };
+    input.onblur = rename;
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+      else if (e.key === 'Escape') { e.preventDefault(); input.value = currentName; input.blur(); }
+    };
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'hbtn';
+    remove.textContent = '删除 Delete';
+    remove.onclick = () => {
+      saveNamePool(namePool().filter(n => n !== currentName));
+      renderNamePoolManager();
+    };
+    row.append(input, remove);
+    box.appendChild(row);
+  }
 }
 
 function locateSpeaker(id) {
@@ -872,18 +1031,7 @@ for (const r of document.querySelectorAll('input[name="exp-fmt"]')) {
 
 document.getElementById('export-btn').onclick = () => {
   const pool = namePool();
-  let datalist = document.getElementById('spk-pool');
-  if (!datalist) {
-    datalist = document.createElement('datalist');
-    datalist.id = 'spk-pool';
-    document.body.appendChild(datalist);
-  }
-  datalist.textContent = '';
-  for (const n of pool) {
-    const opt = document.createElement('option');
-    opt.value = n;
-    datalist.appendChild(opt);
-  }
+  refreshNameDatalist(pool);
   const ids = [...new Set(history.map(e => e.speaker).filter(s => s != null))]
     .sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
   const box = document.getElementById('spk-inputs');
@@ -913,17 +1061,18 @@ document.getElementById('export-btn').onclick = () => {
   openModal('export-mask');
 };
 
+document.getElementById('pool-toggle').onclick = (e) => {
+  const manager = document.getElementById('pool-manager');
+  manager.hidden = !manager.hidden;
+  e.currentTarget.setAttribute('aria-expanded', manager.hidden ? 'false' : 'true');
+  if (!manager.hidden) renderNamePoolManager();
+};
+
 document.getElementById('export-go').onclick = () => {
-  const pool = namePool();
   let renamed = false;
   for (const input of document.querySelectorAll('#spk-inputs input')) {
-    const name = input.value.trim();
-    if (!name) continue;
-    if (sessionNames[input.dataset.spk] !== name) renamed = true;
-    sessionNames[input.dataset.spk] = name;
-    if (!pool.includes(name)) pool.push(name);
+    if (setSessionName(input.dataset.spk, input.value)) renamed = true;
   }
-  localStorage.setItem('babel_spk_pool', JSON.stringify(pool));
   if (renamed) renderAll();  // margin labels pick up the names live
   const kind = document.querySelector('input[name="exp-kind"]:checked').value;
   const fmt = document.querySelector('input[name="exp-fmt"]:checked').value;
