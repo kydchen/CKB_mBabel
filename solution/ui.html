@@ -528,6 +528,7 @@ const history = [];        // committed: {id, lang, source, speaker, ts}
 const transById = {};      // id -> translation
 const seenIds = new Set();
 const sessionNames = {};   // speaker id -> name (this page session)
+let sessionEnded = false;  // deliberate end: suppress the reconnect loop
 const SPCOLORS = ['#3D5A80','#5A7247','#A9752F','#7B4B67','#4E616C','#8C5040'];
 
 // keep --strip-h in sync so the follow button always floats just above the
@@ -809,6 +810,10 @@ function connect() {
     document.getElementById('device-btn').style.display = 'none';
     pauseBtn.hidden = true;
     endBtn.hidden = true;
+    if (sessionEnded) {  // deliberate end: keep the page for export, no retries
+      setLive('ended');
+      return;
+    }
     setLive('reconnecting…');
     setTimeout(connect, 1500 + (Math.random() - 0.5) * 1000);
   };
@@ -863,6 +868,7 @@ function connect() {
       setLive(ev.text === 'connected' ? '' : ev.text);
     }
     else if (ev.type === 'ending') {
+      sessionEnded = true;
       pauseBtn.disabled = true;
       endBtn.disabled = true;
       setLive('ending…');
@@ -872,7 +878,7 @@ function connect() {
       candidateReview = null;
       candidateBanner.classList.remove('show');
       document.getElementById('candidates-mask').classList.remove('open');
-      if (ev.exit_after) setLive('ending…');
+      if (ev.exit_after) { sessionEnded = true; setLive('ending…'); }
     }
     else if (ev.type === 'candidates_error') {
       document.getElementById('candidates-error').textContent = ev.text || '保存失败 Save failed';

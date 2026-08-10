@@ -1620,7 +1620,9 @@ async def run(args) -> None:
         elif kind == "end":
             if shutdown_reason["value"] is None:
                 if ui:
-                    await ui.emit_control({"type": "ending"})
+                    # broadcast, not control-only: viewers' pages must also
+                    # learn this close is final and stop showing reconnecting
+                    await ui.emit({"type": "ending"})
                 request_shutdown("ui")
         elif kind == "candidates_get":
             await emit_review(False)
