@@ -844,6 +844,9 @@ function connect() {
     }
     else if (ev.type === 'devices') onDevices(ev);
     else if (ev.type === 'pause_state') {
+      // "resuming…" is only meaningful on a paused → unpaused transition;
+      // the snapshot reply to the connect-time pause_get must show LIVE
+      const wasPaused = pauseBtn.dataset.paused === '1';
       pauseBtn.dataset.paused = ev.paused ? '1' : '0';
       pauseBtn.classList.toggle('is-paused', !!ev.paused);
       pauseBtn.setAttribute('aria-pressed', ev.paused ? 'true' : 'false');
@@ -854,7 +857,7 @@ function connect() {
         hearing.textContent = '';
         clearDraft();
       }
-      setLive(ev.paused ? 'paused' : 'resuming…');
+      setLive(ev.paused ? 'paused' : (wasPaused ? 'resuming…' : ''));
     }
     else if (ev.type === 'status') {
       setLive(ev.text === 'connected' ? '' : ev.text);
