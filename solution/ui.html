@@ -33,7 +33,7 @@
   }
 
   header {
-    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; row-gap: 5px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap; row-gap: 5px;
     padding: 13px 28px 11px; border-bottom: 1px solid var(--hair);
   }
   .wordmark { font-family: var(--serif); font-size: 19px; font-weight: 700; }
@@ -48,6 +48,11 @@
   }
   header nav a:hover, header nav select:hover, header nav button:hover { border-bottom-color: var(--ink-2); }
   header nav::-webkit-scrollbar { display: none; }
+  .transport {
+    display: flex; align-items: center; gap: 2px; min-height: 32px;
+    padding: 2px 4px 2px 9px; border: 1px solid var(--hair); border-radius: 8px;
+    background: var(--strip); box-shadow: inset 0 1px rgba(255,255,255,.18);
+  }
   #live-dot { font-size: 13px; color: var(--ink-3); white-space: nowrap; }
   #live-dot::before {
     content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
@@ -55,11 +60,35 @@
     animation: breathe 2.4s ease-in-out infinite;
   }
   #live-dot.off::before { background: var(--ink-3); animation: none; }
+  .transport-key {
+    width: 28px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+    color: var(--ink-2); background: transparent; border: 0; border-radius: 5px;
+    cursor: pointer;
+  }
+  .transport-key:hover { color: var(--ink); background: var(--paper); }
+  .transport-key:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+  .transport-key:disabled { color: var(--ink-3); cursor: default; background: transparent; }
+  .transport-key svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7; }
+  #pause-btn .icon-play { display: none; }
+  #pause-btn.is-paused .icon-pause { display: none; }
+  #pause-btn.is-paused .icon-play { display: block; }
+  #end-btn:hover { color: var(--accent); }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+  }
   #device-btn.warning { color: var(--accent); font-weight: 600; }
   #device-warning {
     display: none; padding: 7px 28px; background: var(--accent); color: var(--paper);
     font-size: 13px; line-height: 1.4;
   }
+  #candidate-banner {
+    display: none; width: 100%; padding: 8px 28px; color: var(--accent);
+    background: var(--accent-soft); border: 0; border-bottom: 1px solid var(--hair);
+    font: 600 13px/1.4 var(--sans); text-align: left; cursor: pointer;
+  }
+  #candidate-banner.show { display: block; }
+  #candidate-banner:hover { background: var(--strip); }
   @keyframes breathe { 50% { opacity: .35; } }
   body.fs-xl header { display: none; }
   #pres-exit {
@@ -245,6 +274,23 @@
     margin-top: 14px; width: 100%; padding: 8px; font-size: 15px; font-weight: 600;
     background: var(--accent); color: var(--paper); border: none; border-radius: 8px; cursor: pointer;
   }
+  .modal .candidate-row {
+    display: grid; grid-template-columns: 20px minmax(7rem, auto) 4rem 1fr;
+    gap: 10px; align-items: baseline; padding: 9px 0; margin: 0;
+    border-bottom: 1px solid var(--hair);
+  }
+  .candidate-row input { width: 17px; height: 17px; margin-top: 3px; }
+  .candidate-word { font-family: var(--serif); color: var(--ink); font-weight: 700; }
+  .candidate-count { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .candidate-example { color: var(--ink-2); font-size: 13px; line-height: 1.45; }
+  .review-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 18px; }
+  .review-actions button {
+    min-height: 40px; border: 1px solid var(--hair); border-radius: 8px;
+    background: var(--strip); color: var(--ink); font: 600 14px var(--sans); cursor: pointer;
+  }
+  .review-actions #candidates-merge { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+  .review-actions button:disabled { opacity: .55; cursor: default; }
+  #candidates-error { min-height: 1.4em; color: var(--accent); font-size: 13px; }
   .lab-row { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0; }
   .lab-row input[type=checkbox] { width: 18px; height: 18px; flex: none; margin-top: 4px; }
   .device-row { margin: 13px 0; }
@@ -265,13 +311,16 @@
     header { padding: 10px 14px 8px; row-gap: 4px; }
     #device-warning { padding: 7px 14px; }
     /* two clean rows: wordmark … LIVE / one horizontally-scrollable control row */
-    #live-dot { margin-left: auto; order: 1; }
+    .transport { margin-left: auto; order: 1; }
     header nav {
       order: 2; flex-basis: 100%; margin-left: 0;
       flex-wrap: nowrap; overflow-x: auto; gap: 14px;
       -webkit-overflow-scrolling: touch; scrollbar-width: none;
     }
     header nav a, header nav select { font-size: 13px; }
+    #candidate-banner { padding: 8px 14px; }
+    .candidate-row { grid-template-columns: 20px 1fr 3.5rem; }
+    .candidate-example { grid-column: 2 / -1; }
     .turn { grid-template-columns: 1fr; gap: 2px; padding-left: 10px; padding-right: 2px; }
     .who { text-align: left; display: flex; gap: 10px; align-items: baseline; }
     .who .name { justify-content: flex-start; }
@@ -306,15 +355,28 @@
       <option value="xl">投屏 XL</option>
     </select>
     <a id="device-btn" title="声音设备 Audio devices" style="display:none">声音 Audio</a>
-    <button id="pause-btn" type="button" aria-pressed="false" title="暂停或恢复字幕 Pause or resume captions" style="display:none">暂停 Pause</button>
     <a id="lab-btn">实验 Lab</a>
     <a id="share-btn" style="display:none">分享 Share</a>
     <a id="info-btn">说明 About</a>
     <a id="export-btn">导出 Export</a>
   </nav>
-  <span id="live-dot">LIVE</span>
+  <div class="transport" aria-label="会议控制 Meeting transport">
+    <span id="live-dot">LIVE</span>
+    <button id="pause-btn" class="transport-key" type="button" aria-pressed="false"
+            aria-label="暂停字幕 Pause captions" title="暂停字幕 Pause captions" hidden>
+      <svg class="icon-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.25 3.5v9M10.75 3.5v9"/></svg>
+      <svg class="icon-play" viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 3.5 7 4.5-7 4.5Z"/></svg>
+      <span class="sr-only">暂停字幕 Pause captions</span>
+    </button>
+    <button id="end-btn" class="transport-key" type="button"
+            aria-label="结束会议 End meeting" title="结束会议 End meeting" hidden>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4.25" y="4.25" width="7.5" height="7.5" rx=".5"/></svg>
+      <span class="sr-only">结束会议 End meeting</span>
+    </button>
+  </div>
 </header>
 <div id="device-warning"></div>
+<button id="candidate-banner" type="button"></button>
 
 <main id="main"><div class="script" id="script"></div></main>
 <button id="follow-btn">↓ 回到最新 latest</button>
@@ -406,8 +468,8 @@
     <span class="en">The refined pass carries the previous four source/translation pairs (ark); glossary still applies. No separate polish toggle.</span><br>
     <span id="stats-line" style="color:var(--ink-3)">近 60 秒请求 Requests 60s:…</span></p>
     <h3>识别纠错 ASR correction</h3>
-    <p style="font-size:13.5px"><span class="zh">修的是<span class="k">语音识别听错的词</span>(原文里的错字),不是翻译。写法:错词=正确词,例:CKG=CKB。即时对后续句子生效,不回改历史;退出时存入术语表。</span>
-    <span class="en">This fixes <span class="k">what the ASR misheard</span> (wrong words in the ORIGINAL line), not translation. Format: wrong=right, e.g. CKG=CKB. Applies to future sentences only; persists on exit for the next meeting.</span></p>
+    <p style="font-size:13.5px"><span class="zh">修的是<span class="k">语音识别听错的词</span>(原文里的错字),不是翻译。写法:错词=正确词,例:CKG=CKB。即时对后续句子生效并立即存入术语表,不回改历史。</span>
+    <span class="en">This fixes <span class="k">what the ASR misheard</span> (wrong words in the ORIGINAL line), not translation. Format: wrong=right, e.g. CKG=CKB. It applies to future sentences and is saved immediately; history is unchanged.</span></p>
     <div class="lab-row">
       <input type="text" id="corr-input" placeholder="eg: CKG=CKB">
       <button class="hbtn" id="corr-go">提交 Add</button>
@@ -439,6 +501,20 @@
       <div id="pool-rows"></div>
     </div>
     <button id="export-go">下载 .md Download</button>
+  </div>
+</div>
+
+<div class="modal-mask" id="candidates-mask" role="dialog" aria-modal="true" aria-labelledby="candidates-title">
+  <div class="modal">
+    <h2 id="candidates-title">会议语言包审核 · Meeting language review</h2>
+    <p class="zh">只勾选你确定要在以后会议中优先识别的词。默认不选择。</p>
+    <p class="en">Select only terms you want prioritized in future meetings. Nothing is selected by default.</p>
+    <div id="candidate-list"></div>
+    <p id="candidates-error"></p>
+    <div class="review-actions">
+      <button id="candidates-merge" type="button">并入语言包 Merge selected</button>
+      <button id="candidates-skip" type="button">跳过 Skip</button>
+    </div>
   </div>
 </div>
 
@@ -709,6 +785,9 @@ let wsConn = null;
 let controlToken = null;
 let devicePanelOpened = false;
 const pauseBtn = document.getElementById('pause-btn');
+const endBtn = document.getElementById('end-btn');
+const candidateBanner = document.getElementById('candidate-banner');
+let candidateReview = null;
 function wsSend(obj) {
   if (wsConn && wsConn.readyState === 1 && controlToken) {
     wsConn.send(JSON.stringify({...obj, token: controlToken}));
@@ -728,7 +807,8 @@ function connect() {
   ws.onclose = () => {
     controlToken = null;
     document.getElementById('device-btn').style.display = 'none';
-    pauseBtn.style.display = 'none';
+    pauseBtn.hidden = true;
+    endBtn.hidden = true;
     setLive('reconnecting…');
     setTimeout(connect, 1500 + (Math.random() - 0.5) * 1000);
   };
@@ -754,15 +834,22 @@ function connect() {
     else if (ev.type === 'control_token') {
       controlToken = ev.token;
       document.getElementById('device-btn').style.display = '';
-      pauseBtn.style.display = '';
+      pauseBtn.hidden = false;
+      endBtn.hidden = false;
+      pauseBtn.disabled = false;
+      endBtn.disabled = false;
       wsSend({type: 'devices_get'});
       wsSend({type: 'pause_get'});
+      wsSend({type: 'candidates_get'});
     }
     else if (ev.type === 'devices') onDevices(ev);
     else if (ev.type === 'pause_state') {
       pauseBtn.dataset.paused = ev.paused ? '1' : '0';
-      pauseBtn.textContent = ev.paused ? '继续 Resume' : '暂停 Pause';
+      pauseBtn.classList.toggle('is-paused', !!ev.paused);
       pauseBtn.setAttribute('aria-pressed', ev.paused ? 'true' : 'false');
+      const label = ev.paused ? '恢复字幕 Resume captions' : '暂停字幕 Pause captions';
+      pauseBtn.setAttribute('aria-label', label);
+      pauseBtn.title = label;
       if (ev.paused) {
         hearing.textContent = '';
         clearDraft();
@@ -771,6 +858,22 @@ function connect() {
     }
     else if (ev.type === 'status') {
       setLive(ev.text === 'connected' ? '' : ev.text);
+    }
+    else if (ev.type === 'ending') {
+      pauseBtn.disabled = true;
+      endBtn.disabled = true;
+      setLive('ending…');
+    }
+    else if (ev.type === 'candidates') onCandidates(ev);
+    else if (ev.type === 'candidates_resolved') {
+      candidateReview = null;
+      candidateBanner.classList.remove('show');
+      document.getElementById('candidates-mask').classList.remove('open');
+      if (ev.exit_after) setLive('ending…');
+    }
+    else if (ev.type === 'candidates_error') {
+      document.getElementById('candidates-error').textContent = ev.text || '保存失败 Save failed';
+      setCandidateActionsDisabled(false);
     }
     else if (ev.type === 'stats') {
       const el = document.getElementById('stats-line');
@@ -786,7 +889,9 @@ for (const el of document.querySelectorAll('.close')) {
   el.onclick = () => document.getElementById(el.dataset.close).classList.remove('open');
 }
 for (const mask of document.querySelectorAll('.modal-mask')) {
-  mask.onclick = (e) => { if (e.target === mask) mask.classList.remove('open'); };
+  mask.onclick = (e) => {
+    if (e.target === mask && mask.id !== 'candidates-mask') mask.classList.remove('open');
+  };
 }
 // dialogs show ONE language; default follows the reading view until the
 // viewer flips it manually
@@ -889,9 +994,82 @@ function onDevices(ev) {
 deviceBtn.onclick = () => openModal('device-mask');
 pauseBtn.onclick = () =>
   wsSend({type: 'pause', paused: pauseBtn.dataset.paused !== '1'});
+endBtn.onclick = () => {
+  if (!confirm('结束会议并终止所有观众的字幕？\nEnd the meeting and stop captions for every viewer?')) return;
+  endBtn.disabled = true;
+  wsSend({type: 'end'});
+};
 micSelect.onchange = sendAudioSettings;
 systemToggle.onchange = sendAudioSettings;
 speakerSelect.onchange = sendAudioSettings;
+
+// ---- meeting-language review (host only) ----
+function setCandidateActionsDisabled(disabled) {
+  document.getElementById('candidates-merge').disabled = disabled;
+  document.getElementById('candidates-skip').disabled = disabled;
+}
+
+function renderCandidateReview() {
+  const box = document.getElementById('candidate-list');
+  box.textContent = '';
+  const candidates = candidateReview ? candidateReview.candidates : [];
+  if (!candidates.length) {
+    const empty = document.createElement('p');
+    empty.textContent = '本场没有候选词。No candidates from this meeting.';
+    box.appendChild(empty);
+    return;
+  }
+  candidates.forEach((item, index) => {
+    const row = document.createElement('label');
+    row.className = 'candidate-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.dataset.index = index;
+    const word = document.createElement('span');
+    word.className = 'candidate-word';
+    word.textContent = item.word;
+    const count = document.createElement('span');
+    count.className = 'candidate-count';
+    count.textContent = `× ${item.count}`;
+    const example = document.createElement('span');
+    example.className = 'candidate-example';
+    example.textContent = item.example;
+    row.append(checkbox, word, count, example);
+    box.appendChild(row);
+  });
+}
+
+function openCandidateReview() {
+  if (!candidateReview) return;
+  document.getElementById('candidates-error').textContent = '';
+  setCandidateActionsDisabled(false);
+  renderCandidateReview();
+  openModal('candidates-mask');
+}
+
+function onCandidates(ev) {
+  candidateReview = ev;
+  if (ev.open) {
+    candidateBanner.classList.remove('show');
+    openCandidateReview();
+    return;
+  }
+  const count = (ev.candidates || []).length;
+  candidateBanner.textContent = `上场会议有 ${count} 个候选词待审 / ${count} candidates from last meeting`;
+  candidateBanner.classList.add('show');
+}
+
+function submitCandidateReview(action) {
+  if (!candidateReview) return;
+  const selected = [...document.querySelectorAll('#candidate-list input:checked')]
+    .map(input => Number(input.dataset.index));
+  setCandidateActionsDisabled(true);
+  wsSend({type: 'candidates_review', id: candidateReview.id, action, selected});
+}
+
+candidateBanner.onclick = openCandidateReview;
+document.getElementById('candidates-merge').onclick = () => submitCandidateReview('merge');
+document.getElementById('candidates-skip').onclick = () => submitCandidateReview('skip');
 
 // ---- lab ----
 function setLabEnabled(on) {

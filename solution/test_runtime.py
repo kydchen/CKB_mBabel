@@ -49,6 +49,30 @@ class DummyAsr:
         await asyncio.sleep(60)
 
 
+class CorrectionAsr(DummyAsr):
+    glossary_path = None
+
+    async def transcribe(self, chunks):
+        await DummyUI.instance.on_control(
+            {"type": "correction", "wrong": "you double v", "right": "UW"}
+        )
+        with open(self.glossary_path, encoding="utf-8") as f:
+            assert json.load(f)["corrections"]["you double v"] == "UW"
+        assert not [name for name in os.listdir(os.path.dirname(self.glossary_path))
+                    if name.startswith(os.path.basename(self.glossary_path) + ".")
+                    and name.endswith(".tmp")]
+        yield SimpleNamespace(text="", utterances=[], is_last=True)
+
+
+class SignalCorrectionAsr(DummyAsr):
+    async def transcribe(self, chunks):
+        await DummyUI.instance.on_control(
+            {"type": "correction", "wrong": "you double v", "right": "UW"}
+        )
+        async for event in super().transcribe(chunks):
+            yield event
+
+
 class DraftAsr(DummyAsr):
     async def transcribe(self, chunks):
         yield SimpleNamespace(text="这是第一句非常非常长的内容", utterances=[],
@@ -313,10 +337,29 @@ def make_args(temp_dir, wav):
 async def signal_check(temp_dir):
     args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
     args.no_ui = False
+    args.glossary = os.path.join(temp_dir, "glossary-signal.json")
+    with open(os.path.join(SOLUTION, "glossary.json"), encoding="utf-8") as src, \
+         open(args.glossary, "w", encoding="utf-8") as dst:
+        dst.write(src.read())
     asyncio.get_running_loop().call_later(
         0.2, os.kill, os.getpid(), signal.SIGTERM
     )
-    with patch.object(babel, "CaptionUI", DummyUI), \
+    asyncio.get_running_loop().call_later(
+        0.22, os.kill, os.getpid(), signal.SIGINT
+    )
+    class SlowPolisher(DummyTranslator):
+        usage = (12, 4, 1)
+
+        async def translate(self, text, src, tgt, **kwargs):
+            await asyncio.sleep(0.3)
+            return "translated"
+
+    translator = DummyTranslator()
+    translator.usage = {}
+    with patch.object(babel, "VolcAsrClient", SignalCorrectionAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel, "build_translator", return_value=translator), \
+         patch.object(babel, "ArkTranslator", return_value=SlowPolisher()), \
          patch.object(babel.webbrowser, "open", return_value=True):
         await babel.run(args)
     assert not os.path.exists(babel.session_file_path(args.port))
@@ -325,6 +368,98 @@ async def signal_check(temp_dir):
     assert len(markdown) == 1, markdown
     with open(os.path.join(transcript_dir, markdown[0]), encoding="utf-8") as f:
         assert "测试句。" in f.read()
+    with open(os.path.join(transcript_dir, "usage.jsonl"), encoding="utf-8") as f:
+        assert json.loads(f.readlines()[-1])["ark/polish"]["calls"] == 1
+    with open(args.glossary, encoding="utf-8") as f:
+        assert json.load(f)["corrections"]["you double v"] == "UW"
+
+
+async def immediate_correction_check(temp_dir):
+    glossary_path = os.path.join(temp_dir, "glossary-d4.json")
+    with open(os.path.join(SOLUTION, "glossary.json"), encoding="utf-8") as src, \
+         open(glossary_path, "w", encoding="utf-8") as dst:
+        dst.write(src.read())
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    args.glossary = glossary_path
+    CorrectionAsr.glossary_path = glossary_path
+    with patch.object(babel, "VolcAsrClient", CorrectionAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True), \
+         patch.object(babel.os, "replace", wraps=os.replace) as replaced:
+        await babel.run(args)
+    assert any(call.args[0].endswith(".tmp") and call.args[1] == glossary_path
+               for call in replaced.call_args_list), replaced.call_args_list
+    with open(glossary_path, encoding="utf-8") as f:
+        assert json.load(f)["corrections"]["you double v"] == "UW"
+
+
+def candidate_check(temp_dir):
+    records = [
+        {"source": "NovaChain met CKB and 新星链。"},
+        {"source": "NovaChain met CKB and 新星链。"},
+        {"source": "NovaChain met CKB and 新星链。"},
+        {"source": "RareName appears once."},
+    ]
+    candidates = babel.extract_language_candidates(
+        records, ["CKB"], {"you double v": "UW"}
+    )
+    found = {item["word"]: item["count"] for item in candidates}
+    assert found == {"NovaChain": 3, "新星链": 3, "UW": 1}, found
+    assert all(item["word"] != "CKB" for item in candidates)
+
+    hotwords_path = os.path.join(temp_dir, "hotwords", "from-meetings.txt")
+    with open(hotwords_path, "w", encoding="utf-8") as f:
+        f.write("# meeting review\nCKB\n")
+    babel.atomic_merge_hotwords(hotwords_path, ["NovaChain", "ckb"])
+    with open(hotwords_path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert lines == ["# meeting review", "CKB", "NovaChain"], lines
+
+    pending_dir = os.path.join(temp_dir, "candidate-pending")
+    os.mkdir(pending_dir)
+    older = os.path.join(pending_dir, "older-candidates.json")
+    newer = os.path.join(pending_dir, "newer-candidates.json")
+    babel.write_candidates(older, "older", candidates[:1])
+    babel.write_candidates(newer, "newer", candidates[1:])
+    os.utime(older, (1, 1))
+    os.utime(newer, (2, 2))
+    path, payload = babel.latest_candidates(pending_dir)
+    assert path == newer and payload["stamp"] == "newer"
+    assert not os.path.exists(older)
+
+
+class EndNoReviewAsr(DummyAsr):
+    async def transcribe(self, chunks):
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "测试句。",
+                "start_time": 0,
+                "end_time": 100,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
+            is_last=False,
+        )
+        await asyncio.sleep(0)
+        await DummyUI.instance.on_control({"type": "end"})
+        await asyncio.sleep(60)
+
+
+async def review_wait_signal_check(temp_dir):
+    """A signal during the post-stop review wait must end the run, not hang."""
+    args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    asyncio.get_running_loop().call_later(
+        0.4, os.kill, os.getpid(), signal.SIGTERM
+    )
+    with patch.object(babel, "VolcAsrClient", EndNoReviewAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True):
+        await asyncio.wait_for(babel.run(args), 10)
+    assert any(e.get("type") == "candidates" and e.get("open")
+               for e in DummyUI.events), "review modal was never offered"
 
 
 def write_test_session(port, pid, url):
@@ -807,6 +942,9 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(bind_race_reopen_check(temp_dir))
         asyncio.run(different_port_lifecycle_check(temp_dir))
         asyncio.run(signal_check(temp_dir))
+        asyncio.run(immediate_correction_check(temp_dir))
+        candidate_check(temp_dir)
+        asyncio.run(review_wait_signal_check(temp_dir))
         asyncio.run(audio_failure_check(temp_dir))
         asyncio.run(wav_failure_check(temp_dir))
         output_router_check()
@@ -823,4 +961,4 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(reconnect_check(temp_dir))
         assert time.monotonic() - started < 5
 
-print("runtime: sessions, drafts, context, pause, signals, mixer fallback, and reconnect pass")
+print("runtime: sessions, D4 persistence/candidates, drafts, pause, mixer, and reconnect pass")

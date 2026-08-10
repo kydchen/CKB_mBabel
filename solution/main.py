@@ -24,7 +24,7 @@ import sys
 import time
 import wave
 import webbrowser
-from collections import deque
+from collections import Counter, deque
 from urllib.parse import urlsplit
 
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
@@ -1134,6 +1134,175 @@ def _append_jsonl(path: str, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _atomic_write_text(path: str, text: str) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_merge_glossary(path: str, corrections: dict | None = None,
+                          terms: list[dict] | None = None) -> None:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("glossary root must be an object")
+    if corrections:
+        disk_corrections = data.setdefault("corrections", {})
+        if not isinstance(disk_corrections, dict):
+            raise ValueError("glossary corrections must be an object")
+        disk_corrections.update(corrections)
+    if terms:
+        disk_terms = data.setdefault("terms", [])
+        if not isinstance(disk_terms, list):
+            raise ValueError("glossary terms must be a list")
+        existing = {(item.get("source"), item.get("target"))
+                    for item in disk_terms if isinstance(item, dict)}
+        for term in terms:
+            pair = (term.get("source"), term.get("target"))
+            if all(pair) and pair not in existing:
+                disk_terms.append({"source": pair[0], "target": pair[1]})
+                existing.add(pair)
+    _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def atomic_merge_hotwords(path: str, words: list[str]) -> None:
+    lines = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f]
+    known = {line.strip().casefold() for line in lines
+             if line.strip() and not line.lstrip().startswith("#")}
+    for word in words:
+        clean = word.strip()
+        if clean and clean.casefold() not in known:
+            lines.append(clean)
+            known.add(clean.casefold())
+    _atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
+
+
+_LATIN_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*(?:[+.-][A-Za-z0-9+.-]+)*)(?![A-Za-z0-9])"
+)
+_CJK_CANDIDATE_RE = re.compile(r"(?<![一-鿿])([一-鿿]{2,6})(?![一-鿿])")
+_CANDIDATE_STOP = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for",
+    "from", "have", "hello", "i", "in", "is", "it", "of", "on", "or",
+    "that", "the", "this", "to", "was", "we", "with", "you",
+    "大家", "大家好", "今天", "可以", "我们", "谢谢", "这个", "那个",
+}
+
+
+def extract_language_candidates(records: list[dict], known_hotwords: list[str],
+                                corrections: dict) -> list[dict]:
+    """Conservative, offline meeting-language candidate extraction."""
+    known = {word.strip().casefold() for word in known_hotwords if word.strip()}
+    counts: Counter[str] = Counter()
+    display: dict[str, str] = {}
+    examples: dict[str, str] = {}
+
+    def add(word: str, example: str) -> None:
+        key = word.casefold()
+        if key in known or key in _CANDIDATE_STOP:
+            return
+        counts[key] += 1
+        display.setdefault(key, word)
+        examples.setdefault(key, example[:180])
+
+    for record in records:
+        source = (record.get("source") or "").strip()
+        if not source:
+            continue
+        for match in _LATIN_CANDIDATE_RE.finditer(source):
+            word = match.group(1).rstrip(".")
+            letters = [char for char in word if char.isalpha()]
+            if (len(letters) >= 2 and
+                    (word[0].isupper() or any(char.isupper() for char in word[1:])
+                     or any(not char.isalpha() for char in word))):
+                add(word, source)
+        for match in _CJK_CANDIDATE_RE.finditer(source):
+            add(match.group(1), source)
+
+    correction_targets = {
+        right.strip().casefold() for right in corrections.values() if right.strip()
+    }
+    for wrong, right in corrections.items():
+        word = right.strip()
+        key = word.casefold()
+        if not word or key in known:
+            continue
+        if counts[key] == 0:
+            display[key] = word
+            examples[key] = next(
+                ((record.get("source") or "")[:180] for record in records
+                 if word.casefold() in (record.get("source") or "").casefold()),
+                f"{wrong} → {word}",
+            )
+        counts[key] = max(1, counts[key])
+
+    candidates = [
+        {"word": display[key], "count": count, "example": examples[key],
+         "kind": "hotword"}
+        for key, count in counts.items()
+        if count >= 3 or key in correction_targets
+    ]
+    return sorted(candidates, key=lambda item: (-item["count"], item["word"].casefold()))[:20]
+
+
+def write_candidates(path: str, stamp: str, candidates: list[dict]) -> None:
+    _atomic_write_text(path, json.dumps(
+        {"stamp": stamp, "created_at": time.time(), "candidates": candidates},
+        ensure_ascii=False, indent=2,
+    ) + "\n")
+
+
+def latest_candidates(transcript_dir: str) -> tuple[str | None, dict | None]:
+    paths = [os.path.join(transcript_dir, name)
+             for name in os.listdir(transcript_dir)
+             if name.endswith("-candidates.json")]
+    paths.sort(key=lambda path: (os.path.getmtime(path), path), reverse=True)
+    for stale in paths[1:]:
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
+    if not paths:
+        return None, None
+    path = paths[0]
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        raw = payload.get("candidates")
+        if not isinstance(raw, list):
+            raise ValueError("invalid candidates")
+        payload["candidates"] = [
+            item for item in raw
+            if isinstance(item, dict) and isinstance(item.get("word"), str)
+            and isinstance(item.get("count"), int)
+            and isinstance(item.get("example"), str)
+        ]
+        if not payload["candidates"]:
+            raise ValueError("empty candidates")
+        return path, payload
+    except (OSError, TypeError, ValueError, AttributeError):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None, None
+
+
 def lan_ip() -> str:
     import socket
     import subprocess
@@ -1194,6 +1363,22 @@ async def maybe_tunnel(port: int):
 async def run(args) -> None:
     if not args.no_ui and reopen_existing_session(args.port):
         return
+
+    run_task = asyncio.current_task()
+    assert run_task is not None
+    cleanup_started = {"v": False}
+    shutdown_reason = {"value": None}
+
+    def request_shutdown(reason: str) -> None:
+        if cleanup_started["v"]:
+            # A signal during the post-stop review wait means: stop waiting.
+            # Persistence already ran; the candidates JSON stays on disk for
+            # the next-launch banner, same as the plain signal-exit path.
+            review_event.set()
+            return
+        if reason == "signal" or shutdown_reason["value"] is None:
+            shutdown_reason["value"] = reason
+        run_task.cancel()
 
     glossary = Glossary.load(args.glossary)
     # Merge hotword files: English/proper nouns become identity translation
@@ -1261,6 +1446,20 @@ async def run(args) -> None:
     # at runtime: the UI can push new corrections mid-meeting.
     corr_map = {k.lower(): v for k, v in glossary.corrections.items()}
     new_corrections: dict = {}  # pushed via UI this session, persisted on exit
+    transcript_dir = os.path.join(os.path.dirname(__file__), "transcripts")
+    os.makedirs(transcript_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M")
+    jsonl_path = os.path.join(transcript_dir, f"babel-{stamp}.jsonl")
+    pending_path, pending_payload = (
+        latest_candidates(transcript_dir) if not args.no_ui else (None, None)
+    )
+    review_state = {
+        "id": os.path.basename(pending_path) if pending_path else None,
+        "path": pending_path,
+        "candidates": (pending_payload or {}).get("candidates", []),
+        "exit_after": False,
+    }
+    review_event = asyncio.Event()
 
     def build_corr_re():
         if not corr_map:
@@ -1390,6 +1589,16 @@ async def run(args) -> None:
     resume_event = asyncio.Event()
     resume_event.set()
 
+    async def emit_review(open_now: bool) -> None:
+        if ui and review_state["id"]:
+            await ui.emit_control({
+                "type": "candidates",
+                "id": review_state["id"],
+                "candidates": review_state["candidates"],
+                "open": open_now,
+                "exit_after": review_state["exit_after"],
+            })
+
     async def on_control(msg: dict) -> None:
         """Control messages from the UI (token-guarded in ui_server)."""
         kind = msg.get("type")
@@ -1401,8 +1610,56 @@ async def run(args) -> None:
                 new_corrections[wrong] = right
                 corr["re"] = build_corr_re()
                 print(f"[corrections] {wrong} -> {right}")
+                try:
+                    atomic_merge_glossary(args.glossary, {wrong: right})
+                except (OSError, TypeError, ValueError) as e:
+                    print(f"[corrections] immediate persistence failed: {e}",
+                          file=sys.stderr)
                 if ui:
                     await ui.emit({"type": "status", "text": f"correction: {wrong} → {right}"})
+        elif kind == "end":
+            if shutdown_reason["value"] is None:
+                if ui:
+                    await ui.emit_control({"type": "ending"})
+                request_shutdown("ui")
+        elif kind == "candidates_get":
+            await emit_review(False)
+        elif kind == "candidates_review" and msg.get("id") == review_state["id"]:
+            action = msg.get("action")
+            if action not in ("merge", "skip"):
+                return
+            selected_indexes = msg.get("selected") or []
+            if not isinstance(selected_indexes, list):
+                return
+            selected = []
+            for index in selected_indexes:
+                if isinstance(index, int) and 0 <= index < len(review_state["candidates"]):
+                    selected.append(review_state["candidates"][index])
+            try:
+                if action == "merge":
+                    words = [item["word"] for item in selected
+                             if item.get("kind") == "hotword" and item.get("word")]
+                    terms = [{"source": item.get("source"), "target": item.get("target")}
+                             for item in selected if item.get("kind") == "term"]
+                    if words:
+                        atomic_merge_hotwords(
+                            os.path.join(args.hotwords_dir, "from-meetings.txt"), words
+                        )
+                    if terms:
+                        atomic_merge_glossary(args.glossary, terms=terms)
+                if review_state["path"]:
+                    os.unlink(review_state["path"])
+            except (OSError, TypeError, ValueError, KeyError) as e:
+                if ui:
+                    await ui.emit_control({"type": "candidates_error", "text": str(e)})
+                return
+            exit_after = review_state["exit_after"]
+            review_state.update(id=None, path=None, candidates=[], exit_after=False)
+            if ui:
+                await ui.emit_control({"type": "candidates_resolved",
+                                       "exit_after": exit_after})
+            if exit_after:
+                review_event.set()
         elif kind == "ddc":
             enabled = bool(msg.get("enabled"))
             if asr.config.enable_ddc != enabled:
@@ -1464,9 +1721,6 @@ async def run(args) -> None:
 
     if ui:
         ui.on_control = on_control
-
-    run_task = asyncio.current_task()
-    assert run_task is not None
     audio_failure = {"error": None}
     producer = (
         asyncio.create_task(wav_chunks(args.wav, queue))
@@ -1480,7 +1734,7 @@ async def run(args) -> None:
         if error is not None:
             audio_failure["error"] = error
             print(f"[audio] input failed: {error}", file=sys.stderr)
-            run_task.cancel()
+            request_shutdown("error")
 
     producer.add_done_callback(audio_done)
 
@@ -1682,14 +1936,9 @@ async def run(args) -> None:
 
     watchdog = asyncio.create_task(silence_watchdog())
 
-    # Transcript auto-save: every committed line is appended as JSONL, and a
-    # Markdown rendering is written on exit. Export from the UI is now a
-    # convenience, not the only copy.
+    # Transcript auto-save: every committed line is appended as JSONL. A
+    # Markdown rendering and language candidates are written on exit.
     transcript_records: list[dict] = []
-    transcript_dir = os.path.join(os.path.dirname(__file__), "transcripts")
-    os.makedirs(transcript_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M")
-    jsonl_path = os.path.join(transcript_dir, f"babel-{stamp}.jsonl")
 
     reconnects = 0
     ever_connected = False
@@ -1718,8 +1967,8 @@ async def run(args) -> None:
         discard_queued_audio(queue)
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        loop.add_signal_handler(sig, run_task.cancel)
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        loop.add_signal_handler(sig, request_shutdown, "signal")
     try:
         while True:  # ASR reconnect loop: survive network blips mid-meeting
             await wait_while_paused()
@@ -1881,10 +2130,17 @@ async def run(args) -> None:
                            f"audio input failed: {audio_failure['error']}"})
             await asyncio.sleep(0)
     finally:
+        # From here on a second signal is deliberately ignored. The first
+        # signal requested shutdown; another must not punch through the
+        # transcript/usage/glossary persistence chain.
+        cleanup_started["v"] = True
         if reconnect_partial["text"] and not line_parts:
             line_parts.append(reconnect_partial["text"])
             reconnect_partial["text"] = ""
-        await flush_line()  # Ctrl-C must not drop the line still accumulating
+        try:
+            await flush_line()  # best effort; committed records persist regardless
+        except (asyncio.CancelledError, Exception) as e:
+            print_safe(f"[cleanup] final line could not settle: {e}", file=sys.stderr)
         producer.cancel()
         watchdog.cancel()
         cleanup_tasks = [producer, watchdog]
@@ -1899,29 +2155,26 @@ async def run(args) -> None:
         if translate_tasks:
             await asyncio.gather(*translate_tasks, return_exceptions=True)
         if new_corrections:
-            # merge into the on-disk glossary without dumping runtime-added
-            # identity terms back into the curated file
             try:
-                with open(args.glossary, encoding="utf-8") as f:
-                    disk = json.load(f)
-                disk.setdefault("corrections", {}).update(new_corrections)
-                with open(args.glossary, "w", encoding="utf-8") as f:
-                    json.dump(disk, f, ensure_ascii=False, indent=2)
+                atomic_merge_glossary(args.glossary, new_corrections)
                 print_safe(f"[corrections] persisted {len(new_corrections)} to glossary.json")
-            except OSError as e:
+            except (OSError, TypeError, ValueError) as e:
                 print_safe(f"[corrections] cannot persist: {e}", file=sys.stderr)
         if transcript_records:
             md_path = jsonl_path.replace(".jsonl", ".md")
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(f"# Babel transcript {stamp}\n\n")
-                for r in transcript_records:
-                    who = (f"Speaker {int(r['speaker']) + 1}"
-                           if r["speaker"] is not None and str(r["speaker"]).isdigit()
-                           else r["speaker"] or "")
-                    when = r.get("time", "")
-                    f.write(f"**{who}** ({r['lang']}) [{when}]: {r['source']}\n\n"
-                            f"> {r['translation']}\n\n")
-            print_safe(f"[transcript] saved {jsonl_path} and {md_path}")
+            lines = [f"# Babel transcript {stamp}\n\n"]
+            for r in transcript_records:
+                who = (f"Speaker {int(r['speaker']) + 1}"
+                       if r["speaker"] is not None and str(r["speaker"]).isdigit()
+                       else r["speaker"] or "")
+                when = r.get("time", "")
+                lines.append(f"**{who}** ({r['lang']}) [{when}]: {r['source']}\n\n"
+                             f"> {r['translation']}\n\n")
+            try:
+                _atomic_write_text(md_path, "".join(lines))
+                print_safe(f"[transcript] saved {jsonl_path} and {md_path}")
+            except OSError as e:
+                print_safe(f"[transcript] cannot save Markdown: {e}", file=sys.stderr)
         # per-feature token accounting for the session
         usage_report = {}
         if hasattr(translator, "usage"):
@@ -1934,11 +2187,45 @@ async def run(args) -> None:
             usage_report["ark/polish"] = {"prompt": p, "completion": c, "calls": n}
         if usage_report:
             print_safe(f"[usage] {json.dumps(usage_report, ensure_ascii=False)}")
-            await asyncio.to_thread(
-                _append_jsonl,
-                os.path.join(transcript_dir, "usage.jsonl"),
-                {"stamp": stamp, **usage_report},
+            try:
+                _append_jsonl(os.path.join(transcript_dir, "usage.jsonl"),
+                              {"stamp": stamp, **usage_report})
+            except OSError as e:
+                print_safe(f"[usage] cannot persist: {e}", file=sys.stderr)
+
+        candidates = extract_language_candidates(
+            transcript_records, hotwords_all, new_corrections
+        )
+        candidates_path = os.path.join(transcript_dir, f"{stamp}-candidates.json")
+        if shutdown_reason["value"] == "ui" and ui:
+            candidates_written = False
+            if candidates:
+                try:
+                    write_candidates(candidates_path, stamp, candidates)
+                    candidates_written = True
+                except OSError as e:
+                    print_safe(f"[candidates] cannot persist: {e}", file=sys.stderr)
+            previous_path = review_state["path"]
+            if (candidates_written and previous_path
+                    and previous_path != candidates_path):
+                try:
+                    os.unlink(previous_path)
+                except OSError:
+                    pass
+            review_state.update(
+                id=os.path.basename(candidates_path),
+                path=candidates_path if candidates_written else None,
+                candidates=candidates,
+                exit_after=True,
             )
+            await emit_review(True)
+            await review_event.wait()
+        elif candidates:
+            try:
+                write_candidates(candidates_path, stamp, candidates)
+            except OSError as e:
+                print_safe(f"[candidates] cannot persist: {e}", file=sys.stderr)
+
         if session_registered:
             clear_session_file(args.port, expected_pid=os.getpid())
         print_safe()
