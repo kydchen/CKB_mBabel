@@ -455,8 +455,11 @@ const draftBoxEl = draftEl.parentElement;
 const draftStableEl = document.getElementById('draft-stable');
 const draftFreshEl = document.getElementById('draft-fresh');
 let draftShown = '';
+let draftStable = '';  // frozen prefix: never rewritten within one sentence
+const DRAFT_TAIL_CAP = 64;  // the moving gray tail stays around half a line
 function clearDraft() {
   draftShown = '';
+  draftStable = '';
   draftStableEl.textContent = '';
   draftFreshEl.textContent = '';
   draftEl.classList.remove('on');
@@ -468,10 +471,15 @@ function renderDraft(text) {
   const max = Math.min(draftShown.length, text.length);
   while (i < max && draftShown[i] === text[i]) i++;
   // never split a latin word or number at the stable/fresh boundary
-  while (i > 0 && i < text.length
+  while (i > draftStable.length && i < text.length
          && /[A-Za-z0-9]/.test(text[i - 1]) && /[A-Za-z0-9]/.test(text[i])) i--;
-  draftStableEl.textContent = text.slice(0, i);
-  draftFreshEl.textContent = text.slice(i);
+  // the anchor only grows: a retranslation that rewrites earlier words is
+  // ignored here and absorbed by the promoted/refined caption instead
+  if (i > draftStable.length) draftStable = text.slice(0, i);
+  let fresh = text.slice(draftStable.length);
+  if (fresh.length > DRAFT_TAIL_CAP) fresh = fresh.slice(0, DRAFT_TAIL_CAP) + '…';
+  draftStableEl.textContent = draftStable;
+  draftFreshEl.textContent = fresh;
   draftShown = text;
   draftEl.classList.add('on');
   draftBoxEl.scrollTop = draftBoxEl.scrollHeight;  // no-op until the 4th line
