@@ -7,3 +7,4 @@ solution/audio_config.json*
 *.log
 .DS_Store
 .gstack/
+feedback/
