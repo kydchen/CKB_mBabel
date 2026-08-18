@@ -30,7 +30,8 @@ from urllib.parse import urlsplit
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from asr_client import AsrConfig, AsrError, VolcAsrClient
-from translate import ArkTranslator, Glossary, build_translator
+from translate import (ArkTranslator, Glossary, build_translator,
+                       translation_rejection_reason)
 from ui_server import CaptionUI
 
 
@@ -325,18 +326,19 @@ LATIN_RE = re.compile(r"[A-Za-z]")
 
 
 def detect_direction(text: str) -> tuple[str, str]:
-    """Return (source_lang, target_lang). Any CJK char means the speaker
-    used Chinese (possibly code-switched), so translate to English."""
-    if CJK_RE.search(text):
-        return "zh", "en"
-    return "en", "zh"
+    """Return direction from the dominant script of the recognized text."""
+    source = dominant_lang(text)
+    return source, "en" if source == "zh" else "zh"
 
 
 def dominant_lang(text: str) -> str:
-    """Rough majority vote by character class, for language-boundary splits."""
+    """Weighted script vote: one CJK character carries about one word."""
     cjk = len(CJK_RE.findall(text))
     latin = len(LATIN_RE.findall(text))
-    return "zh" if cjk >= latin else "en"
+    # ponytail: a 4:1 script weight handles zh with English product terms and
+    # English with one CJK name; use word-level ASR language tags if mixed
+    # utterances ever need finer classification.
+    return "zh" if cjk and cjk * 4 >= latin else "en"
 
 
 # Python's \w matches CJK, which would let a latin run swallow following
@@ -348,8 +350,8 @@ def split_lang_runs(text: str) -> list[tuple[str, str]]:
     """Split text into (lang, chunk) pieces. A latin stretch counts as
     English speech only when it is at least 15 letters AND 4 words — short
     runs and multi-letter terms (Lightning Network, Cell model) embedded in
-    Chinese stay with the Chinese chunk. Anything containing a CJK
-    character counts as Chinese."""
+    Chinese stay with the Chinese chunk. Other mixed chunks use the weighted
+    script vote, so one CJK name does not flip an English sentence."""
     pieces: list[tuple[str, str]] = []
     pos = 0
     for m in LONG_LATIN.finditer(text):
@@ -359,12 +361,12 @@ def split_lang_runs(text: str) -> list[tuple[str, str]]:
             continue  # term or too short, or (defensively) contains CJK
         pre = text[pos : m.start()]
         if pre:
-            pieces.append(("zh" if CJK_RE.search(pre) else "en", pre))
+            pieces.append((dominant_lang(pre), pre))
         pieces.append(("en", m.group(0)))
         pos = m.end()
     rest = text[pos:]
     if rest:
-        pieces.append(("zh" if CJK_RE.search(rest) else "en", rest))
+        pieces.append((dominant_lang(rest), rest))
     return pieces
 
 
@@ -1397,6 +1399,11 @@ async def run(args) -> None:
     for word, priority in file_entries + [(t["source"], -1) for t in glossary.terms]:
         priorities[word] = max(priority, priorities.get(word, -1))
     hotwords_all = list(priorities)
+    identity_terms = {
+        t["source"] for t in glossary.terms
+        if (t.get("source") or "").strip().casefold()
+        == (t.get("target") or "").strip().casefold()
+    }
 
     # Split hotwords into two channels: direct transmission (cap 100 tokens,
     # for table-incompatible entries and English proper nouns) and a
@@ -1774,6 +1781,51 @@ async def run(args) -> None:
                  "ratelimit": deque()}
     last_draft_result = {"text": "", "source": "", "src": "", "time": 0.0}
 
+    def engine_label(engine) -> str:
+        return "ark" if engine is ark_polisher else args.translator
+
+    def accept_translation(source: str, output: str, target: str, seg_id: int,
+                           stage: str, engine: str) -> bool:
+        reason = translation_rejection_reason(
+            source, output, target, identity_terms
+        )
+        if reason:
+            print(f"[translate] rejected seq={seg_id} stage={stage} "
+                  f"engine={engine} reason={reason}", file=sys.stderr)
+            return False
+        return True
+
+    async def request_refined(engine, text: str, src: str, tgt: str,
+                              context: list[dict] | None, seg_id: int,
+                              stage: str, retries: int = 3) -> str | None:
+        """Call one backend and return only an accepted target-language result."""
+        waits = [1, 3]
+        label = engine_label(engine)
+        for attempt in range(retries):
+            if attempt:
+                await asyncio.sleep(waits[min(attempt - 1, len(waits) - 1)])
+            try:
+                req_stats["ark" if engine is ark_polisher else "volc_refined"].append(
+                    time.time()
+                )
+                if engine is ark_polisher:
+                    output = await engine.translate(text, src, tgt, context=context)
+                else:
+                    output = await engine.translate(text, src, tgt)
+            except Exception as e:
+                key = type(e).__name__
+                fail_stats[key] = fail_stats.get(key, 0) + 1
+                if key == "RateLimitError":
+                    req_stats["ratelimit"].append(time.time())
+                    waits = [5, 15]
+                print(f"[translate] attempt {attempt + 1} failed: {e} "
+                      f"(totals: {fail_stats})", file=sys.stderr)
+                continue
+            if accept_translation(text, output, tgt, seg_id, stage, label):
+                return output
+            return None
+        return None
+
     async def draft_translate(text: str, seq: int) -> None:
         """Translate the still-growing sentence for a live draft. Any draft
         newer than what is on screen is shown, even if a newer one is
@@ -1785,6 +1837,10 @@ async def run(args) -> None:
             async with draft_sem:
                 translated = await translator.translate(text, src, tgt, lite=True)
         except Exception:
+            return
+        if not accept_translation(
+            text, translated, tgt, seq, "draft", engine_label(translator)
+        ):
             return
         last_draft_result.update(
             text=translated, source=text, src=src, time=time.time()
@@ -1807,9 +1863,12 @@ async def run(args) -> None:
         # becomes the ≈ provisional translation until the refined pass lands.
         provisional = None
         ld = draft_snap or {"text": "", "source": "", "src": "", "time": 0.0}
+        coverage = len(ld.get("source", "")) / len(text)
         if (ld["text"] and ld["src"] == src
                 and time.time() - ld["time"] < 3.0
-                and len(ld.get("source", "")) / len(text) >= 0.6):
+                and 0.6 <= coverage <= 1.4
+                and accept_translation(text, ld["text"], tgt, seg_id,
+                                       "provisional", "draft")):
             provisional = ld["text"]
             if ui:
                 await ui.emit({"type": "translation", "id": seg_id,
@@ -1822,36 +1881,43 @@ async def run(args) -> None:
         # refined pass: ark with the previous sentences as context (default
         # since W1); volc-mt stays as fallback when ark credentials are absent
         translated = None
+        translation_outcome = "unavailable"
         if provisional is not None and hotword_token_cost(text) <= 6:
             translated = provisional
-        elif text in cache:
+            translation_outcome = "provisional"
+        elif text in cache and accept_translation(
+            text, cache[text], tgt, seg_id, "cache", "cache"
+        ):
             translated = cache[text]
+            translation_outcome = "cache"
         else:
+            cache.pop(text, None)  # never retain a pre-gate or corrupted value
             engine = ark_polisher if ark_polisher is not None else translator
-            waits = [1, 3]
-            for attempt in range(3):
-                if attempt:
-                    await asyncio.sleep(waits[attempt - 1])
-                try:
-                    req_stats["ark" if engine is ark_polisher else "volc_refined"].append(time.time())
-                    if engine is ark_polisher:
-                        translated = await engine.translate(text, src, tgt, context=ctx)
-                    else:
-                        translated = await engine.translate(text, src, tgt)
-                    break
-                except Exception as e:
-                    key = type(e).__name__
-                    fail_stats[key] = fail_stats.get(key, 0) + 1
-                    if key == "RateLimitError":
-                        req_stats["ratelimit"].append(time.time())
-                    print(f"[translate] attempt {attempt + 1} failed: {e} "
-                          f"(totals: {fail_stats})", file=sys.stderr)
-                    if key == "RateLimitError":
-                        waits = [5, 15]
+            translated = await request_refined(
+                engine, text, src, tgt, ctx, seg_id, "final"
+            )
+            if translated is not None:
+                translation_outcome = engine_label(engine)
+            elif engine is ark_polisher:
+                translated = await request_refined(
+                    engine, text, src, tgt, None, seg_id, "ark_no_context", 1
+                )
+                if translated is not None:
+                    translation_outcome = "ark_no_context"
+                elif translator is not engine:
+                    translated = await request_refined(
+                        translator, text, src, tgt, None, seg_id,
+                        "fallback", 1
+                    )
+                    if translated is not None:
+                        translation_outcome = f"{engine_label(translator)}_fallback"
             if translated is None:
                 # both engines failed: the provisional draft is still a
                 # readable line; schedule quiet backfills
                 translated = provisional or "⚠ 翻译失败 translation unavailable"
+                translation_outcome = (
+                    "provisional_pending" if provisional else "unavailable"
+                )
                 translate_tasks.append(
                     asyncio.create_task(
                         backfill(text, seg_id, src, tgt, ctx, context_entry)
@@ -1867,6 +1933,8 @@ async def run(args) -> None:
             await ui.emit({"type": "translation", "id": seg_id, "text": translated})
         record = {"seq": seg_id, "speaker": speaker, "lang": src,
                   "source": text, "translation": translated,
+                  "language_conflict": bool(misrec),
+                  "translation_outcome": translation_outcome,
                   "ts": ts, "time": time.strftime("%H:%M:%S")}
         transcript_records.append(record)
         await asyncio.to_thread(_append_jsonl, jsonl_path, record)
@@ -1883,12 +1951,23 @@ async def run(args) -> None:
         engine = ark_polisher if ark_polisher is not None else translator
         for _ in range(12):
             await asyncio.sleep(15)
-            try:
-                if engine is ark_polisher:
-                    fixed = await engine.translate(text, src, tgt, context=ctx)
-                else:
-                    fixed = await engine.translate(text, src, tgt)
-            except Exception:
+            outcome = f"{engine_label(engine)}_backfill"
+            fixed = await request_refined(
+                engine, text, src, tgt, ctx, seg_id, "backfill", 1
+            )
+            if fixed is None and engine is ark_polisher:
+                fixed = await request_refined(
+                    engine, text, src, tgt, None, seg_id,
+                    "backfill_no_context", 1
+                )
+                outcome = "ark_no_context_backfill"
+                if fixed is None and translator is not engine:
+                    fixed = await request_refined(
+                        translator, text, src, tgt, None, seg_id,
+                        "backfill_fallback", 1
+                    )
+                    outcome = f"{engine_label(translator)}_fallback_backfill"
+            if fixed is None:
                 continue
             cache[text] = fixed
             context_entry["translation"] = fixed
@@ -1897,8 +1976,10 @@ async def run(args) -> None:
             for r in transcript_records:
                 if r["seq"] == seg_id:
                     r["translation"] = fixed
+                    r["translation_outcome"] = outcome
             await asyncio.to_thread(_append_jsonl, jsonl_path,
-                                    {"seq": seg_id, "backfill": fixed})
+                                    {"seq": seg_id, "backfill": fixed,
+                                     "translation_outcome": outcome})
             return
 
     async def flush_line() -> None:

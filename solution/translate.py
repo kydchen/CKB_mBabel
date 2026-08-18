@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -162,6 +164,74 @@ _LEAK_MARKERS = ("Wait,", "wait no", "source text", "target language",
 def _looks_like_reasoning(out: str) -> bool:
     hits = sum(1 for m in _LEAK_MARKERS if m in out)
     return "\n" in out or hits >= 2
+
+
+_CJK_TEXT_RE = re.compile(r"[\u3400-\u9fff]")
+_LATIN_TEXT_RE = re.compile(r"[A-Za-z]")
+_IDENTITY_TOKEN_RE = re.compile(r"[A-Za-z]+|\d+")
+
+
+def _translation_key(text: str) -> str:
+    """Normalize case, width and punctuation for equality/size checks."""
+    return "".join(
+        char.casefold()
+        for char in unicodedata.normalize("NFKC", text)
+        if char.isalnum()
+    )
+
+
+def _identity_only(source: str, identity_terms: set[str] | frozenset[str]) -> bool:
+    key = _translation_key(source)
+    if key in {_translation_key(term) for term in identity_terms}:
+        return True
+    if _CJK_TEXT_RE.search(source):
+        return False
+    tokens = _IDENTITY_TOKEN_RE.findall(source)
+    letters = "".join(char for char in source if char.isascii() and char.isalpha())
+    if not letters:  # numbers and symbols
+        return True
+    if len(tokens) == 1 and len(letters) <= 3:  # OK, zk, AI
+        return True
+    # Acronyms and title-cased names can legitimately remain unchanged.
+    return bool(tokens) and all(
+        token.isdigit() or token.isupper()
+        or (token[:1].isupper() and token[1:].islower())
+        for token in tokens
+    )
+
+
+def translation_rejection_reason(
+    source: str,
+    output: str,
+    target_lang: str,
+    identity_terms: set[str] | frozenset[str] = frozenset(),
+) -> str | None:
+    """Return a stable reason when an alleged translation is unsafe to show."""
+    source_key = _translation_key(source)
+    output_key = _translation_key(output)
+    if not output_key:
+        return "empty"
+    if _looks_like_reasoning(output):
+        return "reasoning_leak"
+
+    same = bool(source_key) and source_key == output_key
+    unchanged_identity = same and _identity_only(source, identity_terms)
+    if same and not unchanged_identity:
+        return "same_as_source"
+
+    # Generous ceiling: normal zh/en expansion stays far below this, while
+    # the real 38x and 154x meeting failures are rejected.
+    if len(output_key) > max(80, len(source_key) * 8):
+        return "excessive_length"
+    if unchanged_identity:
+        return None
+    if target_lang == "zh" and not _CJK_TEXT_RE.search(output):
+        return "missing_target_zh"
+    if target_lang == "en" and not _LATIN_TEXT_RE.search(output):
+        return "missing_target_en"
+    if target_lang not in ("zh", "en"):
+        return "unknown_target"
+    return None
 
 
 def _render_context(context: list[dict]) -> str:

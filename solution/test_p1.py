@@ -6,7 +6,8 @@ import tempfile
 
 from main import (discard_queued_audio, hotword_token_cost, load_hotwords_dir,
                   trim_hotwords)
-from translate import _looks_like_reasoning, _render_context
+from translate import (_looks_like_reasoning, _render_context,
+                       translation_rejection_reason)
 
 
 assert hotword_token_cost("Cell model") == 2
@@ -47,4 +48,16 @@ assert _render_context(context) == (
 assert _looks_like_reasoning("The answer.\nExtra explanation.")
 assert not _looks_like_reasoning("The state rent remains unchanged.")
 
-print("P1: paired context, newline guard, and priority token budget pass")
+identity = {"CKB", "CKCON", "RGB++", "Matt Quinn"}
+assert translation_rejection_reason("Test, test.", "Test, test.", "zh", identity) == "same_as_source"
+assert translation_rejection_reason("你能听到吗？", "你能听到吗？", "en", identity) == "same_as_source"
+assert translation_rejection_reason("Can you hear me?", "Yes, I can.", "zh", identity) == "missing_target_zh"
+assert translation_rejection_reason("你能听到吗？", "当然可以。", "en", identity) == "missing_target_en"
+assert translation_rejection_reason("CKB", "CKB", "zh", identity) is None
+assert translation_rejection_reason("CKCON", "CKCON", "zh", identity) is None
+assert translation_rejection_reason("RGB++", "RGB++", "zh", identity) is None
+assert translation_rejection_reason("Matt Quinn", "Matt Quinn", "zh", identity) is None
+assert translation_rejection_reason("2026", "2026", "zh", identity) is None
+assert translation_rejection_reason("短句", "A" * 81, "en", identity) == "excessive_length"
+
+print("P1: context, translation gate, and priority token budget pass")

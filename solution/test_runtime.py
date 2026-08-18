@@ -9,7 +9,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 import main as babel
 
@@ -25,6 +25,41 @@ class DummyTranslator:
     async def translate(self, text, src, tgt, **kwargs):
         self.calls.append((text, kwargs))
         return "translated"
+
+
+class D5FallbackTranslator(DummyTranslator):
+    usage = {"draft": [0, 0, 0], "refined": [0, 0, 0]}
+    calls = []
+    backfill_calls = 0
+
+    async def translate(self, text, src, tgt, **kwargs):
+        type(self).calls.append((text, dict(kwargs)))
+        if kwargs.get("lite"):
+            return text  # invalid draft: must be dropped without another call
+        if text == "需要补译。":
+            type(self).backfill_calls += 1
+            if self.backfill_calls == 1:
+                return text  # invalid initial fallback
+            return "This needs backfilling."
+        return "这是后备译文。" if tgt == "zh" else "This is the fallback."
+
+
+class D5Polisher(DummyTranslator):
+    usage = [0, 0, 0]
+    calls = []
+
+    async def translate(self, text, src, tgt, **kwargs):
+        context = kwargs.get("context")
+        type(self).calls.append((text, context))
+        if text == "Test, test.":
+            return text if context is not None else "测试，测试。"
+        if text in ("这是中文测试。", "需要补译。"):
+            return text
+        if text == "系统把英语识别成中文。":
+            return "The system recognized English as Chinese."
+        if text == "Please ask 张伟 to vote on the proposal.":
+            return "请张伟对提案投票。"
+        raise AssertionError(text)
 
 
 class DummyAsr:
@@ -126,6 +161,24 @@ class DraftCoverageAsr(DummyAsr):
                 "end_time": 200,
                 "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
             }],
+            is_last=False,
+        )
+        await asyncio.sleep(0.7)
+        yield SimpleNamespace(
+            text="这是上一轮留下的一整段很长草稿",
+            utterances=[],
+            is_last=False,
+        )
+        await asyncio.sleep(0.05)
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "好。",
+                "start_time": 201,
+                "end_time": 300,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
             is_last=True,
         )
 
@@ -188,6 +241,34 @@ class ContextAsr(DummyAsr):
                 "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
             })
         yield SimpleNamespace(text="", utterances=utterances, is_last=True)
+
+
+class LanguageIntegrityAsr(DummyAsr):
+    async def transcribe(self, chunks):
+        yield SimpleNamespace(text="Test, test.", utterances=[], is_last=False)
+        await asyncio.sleep(0.05)
+        texts = [
+            ("Test, test.", "speech_en"),
+            ("这是中文测试。", "speech_mand"),
+            ("系统把英语识别成中文。", "speech_en"),
+            ("Please ask 张伟 to vote on the proposal.", "speech_en"),
+            ("Test, test.", "speech_en"),
+            ("需要补译。", "speech_mand"),
+        ]
+        utterances = [
+            {
+                "definite": True,
+                "text": text,
+                "start_time": index * 100,
+                "end_time": index * 100 + 99,
+                "additions": {"speaker_id": "0", "lid_lang": lid},
+            }
+            for index, (text, lid) in enumerate(texts, 1)
+        ]
+        yield SimpleNamespace(text="", utterances=utterances, is_last=False)
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+        yield SimpleNamespace(text="", utterances=[], is_last=True)
 
 
 class PauseAsr(DummyAsr):
@@ -846,6 +927,98 @@ async def context_check(temp_dir):
     assert [item["translation"] for item in context] == ["translated"] * 4
 
 
+async def language_integrity_check(temp_dir):
+    d5_dir = os.path.join(temp_dir, "d5")
+    hotwords_dir = os.path.join(d5_dir, "hotwords")
+    os.makedirs(hotwords_dir)
+    args = make_args(d5_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    args.hotwords_dir = hotwords_dir
+    fallback = D5FallbackTranslator()
+    polisher = D5Polisher()
+    D5FallbackTranslator.calls.clear()
+    D5FallbackTranslator.backfill_calls = 0
+    D5Polisher.calls.clear()
+    DummyUI.events.clear()
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay):
+        # Keep a tiny ordering gap for the production 15s backfill delay so
+        # the initial append-to-thread finishes before the patch record.
+        await real_sleep(0.05 if delay == 15 else 0)
+
+    errors = io.StringIO()
+    with patch.object(babel, "__file__", os.path.join(d5_dir, "main.py")), \
+         patch.object(babel, "VolcAsrClient", LanguageIntegrityAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel, "build_translator", return_value=fallback), \
+         patch.object(babel, "ArkTranslator", return_value=polisher), \
+         patch.object(babel.webbrowser, "open", return_value=True), \
+         patch.object(babel.asyncio, "sleep", fast_sleep), \
+         redirect_stderr(errors):
+        await babel.run(args)
+
+    transcript_dir = os.path.join(d5_dir, "transcripts")
+    jsonl_path = next(
+        os.path.join(transcript_dir, name)
+        for name in os.listdir(transcript_dir)
+        if name.endswith(".jsonl") and name != "usage.jsonl"
+    )
+    with open(jsonl_path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    records = [row for row in rows if "source" in row]
+    test_records = [row for row in records if row["source"] == "Test, test."]
+    assert [row["translation_outcome"] for row in test_records] == [
+        "ark_no_context", "cache"
+    ], test_records
+    assert all(row["translation"] == "测试，测试。" for row in test_records)
+
+    chinese = next(row for row in records if row["source"] == "这是中文测试。")
+    assert chinese["translation"] == "This is the fallback."
+    assert chinese["translation_outcome"] == "volc-mt_fallback"
+
+    conflict = next(
+        row for row in records if row["source"] == "系统把英语识别成中文。"
+    )
+    assert conflict["lang"] == "zh" and conflict["language_conflict"] is True
+    assert conflict["translation"] == "The system recognized English as Chinese."
+
+    mixed = next(
+        row for row in records
+        if row["source"] == "Please ask 张伟 to vote on the proposal."
+    )
+    assert mixed["lang"] == "en" and mixed["translation"] == "请张伟对提案投票。"
+
+    pending = next(row for row in records if row["source"] == "需要补译。")
+    assert pending["translation_outcome"] == "unavailable"
+    assert pending["translation"].startswith("⚠ ")
+    backfill = next(row for row in rows if row.get("backfill"))
+    assert backfill == {
+        "seq": pending["seq"],
+        "backfill": "This needs backfilling.",
+        "translation_outcome": "volc-mt_fallback_backfill",
+    }, backfill
+
+    assert not [event for event in DummyUI.events if event["type"] == "draft"]
+    committed = {event["id"]: event for event in DummyUI.events
+                 if event["type"] == "committed"}
+    assert committed[conflict["seq"]]["misrec"] is True
+    for event in (event for event in DummyUI.events
+                  if event["type"] == "translation"):
+        source = committed[event["id"]]["source"]
+        assert event["text"] != source, event
+
+    test_contexts = [context for text, context in D5Polisher.calls
+                     if text == "Test, test."]
+    assert test_contexts == [[], None], test_contexts
+    for _text, context in D5Polisher.calls:
+        for item in context or []:
+            assert not item.get("translation") or item["translation"] != item["source"]
+    log = errors.getvalue()
+    assert "reason=same_as_source" in log
+    assert "Test, test." not in log and "这是中文测试。" not in log
+
+
 async def pause_check(temp_dir):
     args = make_args(temp_dir, os.path.join(SOLUTION, "test.wav"))
     args.no_ui = False
@@ -956,9 +1129,10 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(translate_task_pruning_check())
         asyncio.run(committed_draft_clear_check(temp_dir))
         asyncio.run(context_check(temp_dir))
+        asyncio.run(language_integrity_check(temp_dir))
         asyncio.run(pause_check(temp_dir))
         asyncio.run(hotword_budget_check(temp_dir))
         asyncio.run(reconnect_check(temp_dir))
         assert time.monotonic() - started < 5
 
-print("runtime: sessions, D4 persistence/candidates, drafts, pause, mixer, and reconnect pass")
+print("runtime: sessions, D4/D5 integrity, drafts, pause, mixer, and reconnect pass")

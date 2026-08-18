@@ -5,7 +5,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from main import should_flush_clause, split_lang_runs
+from main import detect_direction, should_flush_clause, split_lang_runs
 
 # CJK inside a would-be latin run must not be swallowed
 pieces = split_lang_runs('Fiber的feature是把Lightning Network的能力搬到CKB上')
@@ -25,6 +25,11 @@ assert [lang for lang, _ in pieces] == ['zh', 'en'], pieces
 # short embedded terms never trigger a split
 pieces = split_lang_runs('然后呃我们可以，maybe，可能，呃，hi，Matt，可以听下你的想法了。')
 assert len(pieces) == 1 and pieces[0][0] == 'zh', pieces
+
+# A CJK name does not flip a predominantly English sentence; English product
+# terms likewise do not flip a Chinese sentence.
+assert detect_direction('Please ask 张伟 to vote on the proposal.') == ('en', 'zh')
+assert detect_direction('我们用 CKB 和 Fiber Network 做测试。') == ('zh', 'en')
 
 # long lines flush only when the current fragment ends at a clause boundary
 fragment = '继续说明，'
