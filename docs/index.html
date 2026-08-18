@@ -217,7 +217,8 @@
   }
   .modal .spk-row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
   .modal .spk-row .spname { flex: none; cursor: pointer; font-weight: 600; color: var(--accent); white-space: nowrap; }
-  .modal .spk-row input { flex: 1; }
+  .modal .spk-row .speaker-count { flex: none; color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .modal .spk-row input { flex: 1; min-width: 0; }
   .modal .hbtn {
     font-size: 13px; color: var(--ink); background: var(--strip); border: 1px solid var(--hair);
     border-radius: 6px; padding: 4px 12px; cursor: pointer;
@@ -1021,6 +1022,10 @@ document.getElementById('export-btn').onclick = () => {
     nameEl.title = '点击定位 TA 的句子 Click to locate their lines';
     nameEl.onclick = () => locateSpeaker(id);
     row.appendChild(nameEl);
+    const countEl = document.createElement('span');
+    countEl.className = 'speaker-count';
+    countEl.textContent = `× ${history.filter(e => e.speaker === id).length}`;
+    row.appendChild(countEl);
     const input = document.createElement('input');
     input.type = 'text';
     input.setAttribute('list', 'spk-pool');
