@@ -8,7 +8,7 @@
   :root {
     --paper: #F7F4ED; --ink: #211F1A; --ink-2: #57534A; --ink-3: #8F897C;
     --hair: #E3DDCF; --accent: #B3442A; --accent-soft: rgba(179,68,42,.07);
-    --strip: #F1EDE2;
+    --strip: #F1EDE2; --draft-tail: #746F65;
     --serif: "Charter", "Iowan Old Style", Georgia, "Songti SC", "Noto Serif SC", serif;
     --sans: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
     --sp-indigo:#3D5A80; --sp-moss:#5A7247; --sp-ochre:#A9752F;
@@ -18,7 +18,7 @@
   body.dark {
     --paper: #16150F; --ink: #EAE4D6; --ink-2: #A49D8D; --ink-3: #6E685C;
     --hair: #2C2A22; --accent: #D9704F; --accent-soft: rgba(217,112,79,.10);
-    --strip: #1C1A13;
+    --strip: #1C1A13; --draft-tail: #A49D8D;
   }
   body.fs-s { --fs-trans: 17px; --fs-orig: 12.5px; --fs-hear: 13px; --fs-draft: 15px; }
   body.fs-l { --fs-trans: 26px; --fs-orig: 17px; --fs-hear: 18px; --fs-draft: 22px; }
@@ -103,7 +103,7 @@
   }
   .trans { font-family: var(--serif); font-size: var(--fs-trans); line-height: 1.72; }
   .trans.pending { color: var(--ink-3); font-style: italic; font-size: calc(var(--fs-trans) * .75); }
-  .trans.provisional { color: var(--ink-2); font-style: italic; }  /* draft promoted, refined pending */
+  .trans.provisional { color: var(--draft-tail); font-style: italic; }  /* draft promoted, refined pending */
   .trans.fallback { color: var(--ink-3); }
   body.single .orig { display: none; }
 
@@ -158,7 +158,7 @@
   }
   /* unsettled tail: words not yet confirmed by the next retranslation —
      same voice as the ≈ provisional caption, works in both themes */
-  #draft-fresh { color: var(--ink-2); font-style: italic; }
+  #draft-fresh { color: var(--draft-tail); font-style: italic; }
   #drafting.on::after {
     content: '▌'; color: var(--accent); animation: breathe 1.1s infinite;
     font-family: var(--sans); font-size: calc(var(--fs-draft) * .8);
@@ -447,7 +447,7 @@ function tailTrim(text, max = 240) {  // two-line boxes need a deeper tail buffe
 }
 
 // Draft stability rendering: words that survived one retranslation cycle are
-// "stable" (full ink, never repainted); the divergent tail is "fresh" (ink-2
+// "stable" (full ink, never repainted); the divergent tail is "fresh" (draft-tail
 // italic, the same voice as the ≈ provisional caption). The box is
 // top-anchored, so stable words never MOVE either — until a 4th line pushes
 // the sentence up, one whole line at a time (scrollHeight is line-quantized).
