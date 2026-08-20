@@ -465,6 +465,12 @@
       <label for="ddc-toggle" style="margin:0"><span class="zh">口语顺滑 DDC(去嗯啊结巴,会重启识别连接约 2 秒)</span>
       <span class="en">Disfluency smoothing (DDC). Restarts the ASR session (~2s gap).</span></label>
     </div>
+    <div class="lab-row">
+      <input type="checkbox" id="ark-fast-toggle">
+      <label for="ark-fast-toggle" style="margin:0"><span class="zh">精翻低延迟 (Ark fast)</span>
+      <span class="en">Refined fast tier</span></label>
+    </div>
+    <p id="ark-tier-note" class="device-help" aria-live="polite"></p>
     <p style="font-size:13.5px"><span class="zh">精翻默认带前四组原文/译文上下文(ark),术语表照常注入;无独立润色开关。</span>
     <span class="en">The refined pass carries the previous four source/translation pairs (ark); glossary still applies. No separate polish toggle.</span><br>
     <span id="stats-line" style="color:var(--ink-3)">近 60 秒请求 Requests 60s:…</span></p>
@@ -855,6 +861,7 @@ function connect() {
       wsSend({type: 'devices_get'});
       wsSend({type: 'pause_get'});
       wsSend({type: 'candidates_get'});
+      wsSend({type: 'ark_tier_get'});
     }
     else if (ev.type === 'devices') onDevices(ev);
     else if (ev.type === 'pause_state') {
@@ -893,10 +900,13 @@ function connect() {
       document.getElementById('candidates-error').textContent = ev.text || '保存失败 Save failed';
       setCandidateActionsDisabled(false);
     }
+    else if (ev.type === 'ark_tier_state') onArkTierState(ev);
     else if (ev.type === 'stats') {
       const el = document.getElementById('stats-line');
-      if (el) el.textContent =
-        `近 60 秒请求 60s requests: 草稿 draft ${ev.volc_draft} · 精翻 refined(ark) ${ev.ark} · 限流 rate-limited ${ev.ratelimit}`;
+      const avg = ev.ark_avg_ms == null ? '—' : `${ev.ark_avg_ms} ms`;
+      if (el) el.textContent = `近 60 秒请求 60s requests: 草稿 draft ${ev.volc_draft} · ` +
+        `精翻 refined(ark/${ev.ark_tier || 'default'}) ${ev.ark} · 平均延迟 avg ${avg} · ` +
+        `限流 rate-limited ${ev.ratelimit}`;
     }
   };
 }
@@ -1090,20 +1100,33 @@ document.getElementById('candidates-merge').onclick = () => submitCandidateRevie
 document.getElementById('candidates-skip').onclick = () => submitCandidateReview('skip');
 
 // ---- lab ----
+const arkFastToggle = document.getElementById('ark-fast-toggle');
+let arkTierAvailable = false;
+function onArkTierState(ev) {
+  arkTierAvailable = !!ev.available;
+  arkFastToggle.checked = ev.tier === 'fast';
+  arkFastToggle.disabled = !controlToken || !arkTierAvailable;
+  document.getElementById('ark-tier-note').textContent = ev.notice ||
+    (arkTierAvailable ? '' : 'Ark 精翻当前不可用 / Ark refined translation is unavailable.');
+}
 function setLabEnabled(on) {
   // the language flip is a reading control, not a lab control: never disable it
   for (const el of document.querySelectorAll('#lab-mask input, #lab-mask .hbtn:not(.lang-flip)')) {
     el.disabled = !on;
   }
+  arkFastToggle.disabled = !on || !arkTierAvailable;
   document.getElementById('lab-note').style.display = on ? 'none' : '';
 }
 document.getElementById('lab-btn').onclick = () => {
   setLabEnabled(!!controlToken);
+  wsSend({type: 'ark_tier_get'});
   wsSend({type: 'stats'});
   openModal('lab-mask');
 };
 document.getElementById('ddc-toggle').onchange = (e) =>
   wsSend({type: 'ddc', enabled: e.target.checked});
+arkFastToggle.onchange = (e) =>
+  wsSend({type: 'ark_tier', enabled: e.target.checked});
 document.getElementById('corr-go').onclick = () => {
   const box = document.getElementById('corr-input');
   const i = box.value.indexOf('=');

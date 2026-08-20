@@ -12,6 +12,7 @@ from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
 
 import main as babel
+from translate import ArkTranslator as RealArkTranslator, Glossary
 
 
 SOLUTION = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +63,29 @@ class D5Polisher(DummyTranslator):
         raise AssertionError(text)
 
 
+class D7TierError(Exception):
+    status_code = 400
+
+
+class D7Completions:
+    def __init__(self):
+        self.calls = []
+        self.rejected = False
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if (not self.rejected
+                and kwargs["extra_body"].get("service_tier") == "fast"):
+            self.rejected = True
+            raise D7TierError("service_tier fast is not enabled")
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=8, completion_tokens=4),
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="The default tier succeeded.")
+            )],
+        )
+
+
 class DummyAsr:
     def __init__(self, config):
         self.config = config
@@ -82,6 +106,28 @@ class DummyAsr:
             is_last=False,
         )
         await asyncio.sleep(60)
+
+
+class D7Asr(DummyAsr):
+    async def transcribe(self, chunks):
+        await DummyUI.instance.on_control({"type": "ark_tier_get"})
+        await DummyUI.instance.on_control({"type": "ark_tier", "enabled": True})
+        yield SimpleNamespace(
+            text="",
+            utterances=[{
+                "definite": True,
+                "text": "这是一个足够长的精翻测试句子。",
+                "start_time": 0,
+                "end_time": 100,
+                "additions": {"speaker_id": "0", "lid_lang": "speech_mand"},
+            }],
+            is_last=False,
+        )
+        await asyncio.sleep(0.05)
+        await DummyUI.instance.on_control({"type": "stats"})
+        # Sticky fallback: even an attempted re-enable stays on default.
+        await DummyUI.instance.on_control({"type": "ark_tier", "enabled": True})
+        yield SimpleNamespace(text="", utterances=[], is_last=True)
 
 
 class CorrectionAsr(DummyAsr):
@@ -992,12 +1038,18 @@ async def language_integrity_check(temp_dir):
     pending = next(row for row in records if row["source"] == "需要补译。")
     assert pending["translation_outcome"] == "unavailable"
     assert pending["translation"].startswith("⚠ ")
+    assert all("refined_latency_ms" in row and "refined_tier" in row
+               for row in records)
     backfill = next(row for row in rows if row.get("backfill"))
-    assert backfill == {
+    assert {key: backfill[key] for key in (
+        "seq", "backfill", "translation_outcome", "refined_tier"
+    )} == {
         "seq": pending["seq"],
         "backfill": "This needs backfilling.",
         "translation_outcome": "volc-mt_fallback_backfill",
+        "refined_tier": "default",
     }, backfill
+    assert backfill["refined_latency_ms"] > 0, backfill
 
     assert not [event for event in DummyUI.events if event["type"] == "draft"]
     committed = {event["id"]: event for event in DummyUI.events
@@ -1017,6 +1069,62 @@ async def language_integrity_check(temp_dir):
     log = errors.getvalue()
     assert "reason=same_as_source" in log
     assert "Test, test." not in log and "这是中文测试。" not in log
+
+
+async def ark_tier_runtime_check(temp_dir):
+    d7_dir = os.path.join(temp_dir, "d7")
+    hotwords_dir = os.path.join(d7_dir, "hotwords")
+    os.makedirs(hotwords_dir)
+    glossary_path = os.path.join(d7_dir, "glossary.json")
+    with open(os.path.join(SOLUTION, "glossary.json"), encoding="utf-8") as src, \
+         open(glossary_path, "w", encoding="utf-8") as dst:
+        dst.write(src.read())
+
+    args = make_args(d7_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    args.hotwords_dir = hotwords_dir
+    args.glossary = glossary_path
+    with patch.dict(os.environ, {"ARK_SERVICE_TIER": "default"}):
+        polisher = RealArkTranslator(
+            Glossary.load(glossary_path), "offline-model", api_key="offline"
+        )
+    completions = D7Completions()
+    polisher.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+    DummyUI.events.clear()
+
+    with patch.object(babel, "__file__", os.path.join(d7_dir, "main.py")), \
+         patch.object(babel, "VolcAsrClient", D7Asr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel, "build_translator", return_value=DummyTranslator()), \
+         patch.object(babel, "ArkTranslator", return_value=polisher), \
+         patch.object(babel.webbrowser, "open", return_value=True):
+        await babel.run(args)
+
+    assert [call["extra_body"].get("service_tier")
+            for call in completions.calls] == ["fast", None], completions.calls
+    assert polisher.service_tier == "default" and polisher.fast_tier_rejected
+
+    transcript_dir = os.path.join(d7_dir, "transcripts")
+    jsonl_path = next(
+        os.path.join(transcript_dir, name)
+        for name in os.listdir(transcript_dir)
+        if name.endswith(".jsonl") and name != "usage.jsonl"
+    )
+    with open(jsonl_path, encoding="utf-8") as f:
+        record = next(json.loads(line) for line in f if '"source"' in line)
+    assert record["refined_tier"] == "default", record
+    assert record["refined_latency_ms"] > 0, record
+
+    tier_states = [event for event in DummyUI.events
+                   if event.get("type") == "ark_tier_state"]
+    assert [event["tier"] for event in tier_states] == [
+        "default", "fast", "default", "default"
+    ], tier_states
+    assert tier_states[-1]["notice"] and tier_states[-1]["available"] is True
+    stats = next(event for event in DummyUI.events if event.get("type") == "stats")
+    assert stats["ark_avg_ms"] > 0 and stats["ark_tier"] == "default", stats
 
 
 async def pause_check(temp_dir):
@@ -1130,9 +1238,10 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(committed_draft_clear_check(temp_dir))
         asyncio.run(context_check(temp_dir))
         asyncio.run(language_integrity_check(temp_dir))
+        asyncio.run(ark_tier_runtime_check(temp_dir))
         asyncio.run(pause_check(temp_dir))
         asyncio.run(hotword_budget_check(temp_dir))
         asyncio.run(reconnect_check(temp_dir))
         assert time.monotonic() - started < 5
 
-print("runtime: sessions, D4/D5 integrity, drafts, pause, mixer, and reconnect pass")
+print("runtime: sessions, D4/D5/D7 integrity, drafts, pause, mixer, and reconnect pass")

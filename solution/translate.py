@@ -246,6 +246,21 @@ def _render_context(context: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _fast_tier_rejected(error: Exception) -> bool:
+    """Whether a failed fast request should fall back to the default tier."""
+    text = str(error).casefold()
+    markers = (
+        "service_tier", "service tier", "fast tier", "low latency",
+        "低延迟", "未开通", "not enabled", "not available", "unsupported",
+    )
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    return any(marker in text for marker in markers) or (
+        isinstance(status, int) and 400 <= status < 500 and status != 429
+    )
+
+
 class ArkTranslator:
     """Doubao LLM on Volcengine Ark, glossary via system prompt.
 
@@ -268,6 +283,13 @@ class ArkTranslator:
             raise ValueError("Ark auth missing: set ARK_API_KEY, or AccessKeyID + SecretAccessKey")
         self.usage = [0, 0, 0]  # [prompt_tokens, completion_tokens, calls]
         self.model = model
+        self.fast_tier_rejected = False
+        tier = os.environ.get("ARK_SERVICE_TIER", "default").strip().lower()
+        if tier not in ("default", "fast"):
+            print(f"[translate] invalid ARK_SERVICE_TIER={tier!r}; using default",
+                  file=sys.stderr)
+            tier = "default"
+        self.service_tier = tier
         domain_note = f" Domain: {glossary.domains}." if glossary.domains else ""
         self.system_prompt = (
             "You are a professional Chinese-English interpreter for tech meetings."
@@ -280,9 +302,18 @@ class ArkTranslator:
             f"{glossary.render_table()}"
         )
 
+    def set_service_tier(self, tier: str) -> str:
+        if tier not in ("default", "fast"):
+            raise ValueError("Ark service tier must be 'default' or 'fast'")
+        if tier == "fast" and self.fast_tier_rejected:
+            return self.service_tier
+        self.service_tier = tier
+        return tier
+
     async def translate(self, text: str, source_lang: str, target_lang: str,
                         lite: bool = False,
-                        context: list[dict] | None = None) -> str:
+                        context: list[dict] | None = None,
+                        request_meta: dict | None = None) -> str:
         if context:
             ctx = _render_context(context)
             user = (
@@ -293,8 +324,11 @@ class ArkTranslator:
         else:
             user = f"[{target_lang}] {text}"
 
-        for attempt in range(2):  # second try only on reasoning-leak output
-            resp = await self.client.chat.completions.create(
+        async def create(tier: str):
+            extra_body = {"thinking": {"type": "disabled"}}
+            if tier == "fast":
+                extra_body["service_tier"] = "fast"
+            return await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
@@ -305,9 +339,28 @@ class ArkTranslator:
                 # Doubao Seed 2.x defaults to thinking mode: it burns hundreds of
                 # reasoning tokens and several seconds before answering. Useless
                 # for translation, so disable it (17s -> ~2s on a sentence).
-                extra_body={"thinking": {"type": "disabled"}},
+                extra_body=extra_body,
                 extra_headers={"X-Project-Name": "default"},
             )
+
+        if request_meta is not None:
+            request_meta["tier_fallback"] = False
+        for attempt in range(2):  # second try only on reasoning-leak output
+            tier = self.service_tier
+            if request_meta is not None:
+                request_meta["service_tier"] = tier
+            try:
+                resp = await create(tier)
+            except Exception as error:
+                if tier != "fast" or not _fast_tier_rejected(error):
+                    raise
+                self.fast_tier_rejected = True
+                self.service_tier = tier = "default"
+                if request_meta is not None:
+                    request_meta.update(service_tier=tier, tier_fallback=True)
+                print("[translate] Ark fast tier unavailable; using default for this session",
+                      file=sys.stderr)
+                resp = await create(tier)
             usage = getattr(resp, "usage", None)
             if usage is not None:
                 self.usage[0] += getattr(usage, "prompt_tokens", 0) or 0

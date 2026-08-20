@@ -1583,10 +1583,34 @@ async def run(args) -> None:
     except Exception:
         print("[translate] ark backend unavailable; refined falls back to volc-mt")
 
+    def ark_tier() -> str:
+        return getattr(ark_polisher, "service_tier", "default")
+
+    async def emit_ark_tier_state() -> None:
+        if not ui:
+            return
+        available = ark_polisher is not None and hasattr(
+            ark_polisher, "set_service_tier"
+        )
+        notice = ""
+        if getattr(ark_polisher, "fast_tier_rejected", False):
+            notice = ("Ark fast 未开通或参数被拒，已回退常规档 / "
+                      "Ark fast unavailable; using default tier.")
+        await ui.emit_control({"type": "ark_tier_state",
+                               "tier": ark_tier(),
+                               "available": available,
+                               "notice": notice})
+
     def stats_snapshot() -> dict:
         now = time.time()
-        return {k: sum(1 for t in dq if now - t < 60)
-                for k, dq in req_stats.items()}
+        snapshot = {k: sum(1 for t in dq if now - t < 60)
+                    for k, dq in req_stats.items()}
+        recent_ark = [latency for at, latency in ark_latencies if now - at < 60]
+        snapshot["ark_avg_ms"] = (
+            round(sum(recent_ark) / len(recent_ark)) if recent_ark else None
+        )
+        snapshot["ark_tier"] = ark_tier()
+        return snapshot
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     audio = (None if args.wav else AudioMixer(queue, args.audio_config))
@@ -1669,6 +1693,15 @@ async def run(args) -> None:
                                        "exit_after": exit_after})
             if exit_after:
                 review_event.set()
+        elif kind == "ark_tier_get":
+            await emit_ark_tier_state()
+        elif kind == "ark_tier":
+            if (ark_polisher is not None
+                    and hasattr(ark_polisher, "set_service_tier")):
+                ark_polisher.set_service_tier(
+                    "fast" if bool(msg.get("enabled")) else "default"
+                )
+            await emit_ark_tier_state()
         elif kind == "ddc":
             enabled = bool(msg.get("enabled"))
             if asr.config.enable_ddc != enabled:
@@ -1779,6 +1812,8 @@ async def run(args) -> None:
     # request counters for the Lab stats line (60s sliding window per channel)
     req_stats = {"volc_draft": deque(), "volc_refined": deque(), "ark": deque(),
                  "ratelimit": deque()}
+    ark_latencies: deque[tuple[float, int]] = deque()
+    refined_meta: dict[int, dict] = {}
     last_draft_result = {"text": "", "source": "", "src": "", "time": 0.0}
 
     def engine_label(engine) -> str:
@@ -1799,20 +1834,26 @@ async def run(args) -> None:
                               context: list[dict] | None, seg_id: int,
                               stage: str, retries: int = 3) -> str | None:
         """Call one backend and return only an accepted target-language result."""
+        started = time.monotonic()
         waits = [1, 3]
         label = engine_label(engine)
         for attempt in range(retries):
             if attempt:
                 await asyncio.sleep(waits[min(attempt - 1, len(waits) - 1)])
+            request_meta = {}
             try:
                 req_stats["ark" if engine is ark_polisher else "volc_refined"].append(
                     time.time()
                 )
                 if engine is ark_polisher:
-                    output = await engine.translate(text, src, tgt, context=context)
+                    output = await engine.translate(
+                        text, src, tgt, context=context, request_meta=request_meta
+                    )
                 else:
                     output = await engine.translate(text, src, tgt)
             except Exception as e:
+                if request_meta.get("tier_fallback"):
+                    await emit_ark_tier_state()
                 key = type(e).__name__
                 fail_stats[key] = fail_stats.get(key, 0) + 1
                 if key == "RateLimitError":
@@ -1821,7 +1862,17 @@ async def run(args) -> None:
                 print(f"[translate] attempt {attempt + 1} failed: {e} "
                       f"(totals: {fail_stats})", file=sys.stderr)
                 continue
+            if request_meta.get("tier_fallback"):
+                await emit_ark_tier_state()
             if accept_translation(text, output, tgt, seg_id, stage, label):
+                latency_ms = max(1, round((time.monotonic() - started) * 1000))
+                tier = request_meta.get("service_tier", ark_tier())
+                refined_meta[seg_id] = {
+                    "refined_latency_ms": latency_ms,
+                    "refined_tier": tier,
+                }
+                if engine is ark_polisher:
+                    ark_latencies.append((time.time(), latency_ms))
                 return output
             return None
         return None
@@ -1931,10 +1982,13 @@ async def run(args) -> None:
             await ui.emit({"type": "translation", "id": seg_id, "text": translated})
         elif ui and provisional is None:
             await ui.emit({"type": "translation", "id": seg_id, "text": translated})
+        timing = refined_meta.get(seg_id, {})
         record = {"seq": seg_id, "speaker": speaker, "lang": src,
                   "source": text, "translation": translated,
                   "language_conflict": bool(misrec),
                   "translation_outcome": translation_outcome,
+                  "refined_latency_ms": timing.get("refined_latency_ms"),
+                  "refined_tier": timing.get("refined_tier"),
                   "ts": ts, "time": time.strftime("%H:%M:%S")}
         transcript_records.append(record)
         await asyncio.to_thread(_append_jsonl, jsonl_path, record)
@@ -1977,9 +2031,15 @@ async def run(args) -> None:
                 if r["seq"] == seg_id:
                     r["translation"] = fixed
                     r["translation_outcome"] = outcome
+                    r.update(refined_meta.get(seg_id, {}))
+            timing = refined_meta.get(seg_id, {})
             await asyncio.to_thread(_append_jsonl, jsonl_path,
                                     {"seq": seg_id, "backfill": fixed,
-                                     "translation_outcome": outcome})
+                                     "translation_outcome": outcome,
+                                     "refined_latency_ms": timing.get(
+                                         "refined_latency_ms"
+                                     ),
+                                     "refined_tier": timing.get("refined_tier")})
             return
 
     async def flush_line() -> None:
