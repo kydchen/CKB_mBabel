@@ -107,10 +107,15 @@ class VolcMtTranslator:
                         lite: bool = False) -> str:
         import uuid
 
-        if lite:
-            table = self.forward_lite if target_lang == "en" else self.backward_lite
+        if source_lang == "zh" and target_lang == "en":
+            table = self.forward_lite if lite else self.forward
+        elif source_lang == "en" and target_lang == "zh":
+            table = self.backward_lite if lite else self.backward
         else:
-            table = self.forward if target_lang == "en" else self.backward
+            # The curated non-identity mappings are zh<->en. Other pairs keep
+            # only proper nouns such as CKB=CKB instead of injecting a wrong
+            # Chinese or English target into Vietnamese.
+            table = self.forward_lite
 
         body = {
             "source_language": source_lang,
@@ -229,7 +234,14 @@ def translation_rejection_reason(
         return "missing_target_zh"
     if target_lang == "en" and not _LATIN_TEXT_RE.search(output):
         return "missing_target_en"
-    if target_lang not in ("zh", "en"):
+    if target_lang == "vi" and (
+        not _LATIN_TEXT_RE.search(output)
+        or (not any(char in "\u0300\u0301\u0302\u0303\u0306\u0309\u031b\u0323"
+                    for char in unicodedata.normalize("NFD", output))
+            and _translation_key(output) == source_key)
+    ):
+        return "missing_target_vi"
+    if target_lang not in ("zh", "en", "vi"):
         return "unknown_target"
     return None
 
@@ -238,7 +250,9 @@ def _render_context(context: list[dict]) -> str:
     lines = []
     for item in context:
         source_lang = item["source_lang"]
-        target_lang = "en" if source_lang == "zh" else "zh"
+        target_lang = item.get("target_lang") or (
+            "en" if source_lang == "zh" else "zh"
+        )
         translation = item.get("translation") or "(pending)"
         lines.append(
             f"- {source_lang}: {item['source']} / {target_lang}: {translation}"
@@ -292,9 +306,9 @@ class ArkTranslator:
         self.service_tier = tier
         domain_note = f" Domain: {glossary.domains}." if glossary.domains else ""
         self.system_prompt = (
-            "You are a professional Chinese-English interpreter for tech meetings."
+            "You are a professional interpreter for multilingual tech meetings."
             f"{domain_note}\n"
-            "Translate the user's text between Chinese and English. "
+            "Translate the user's text between the requested source and target languages. "
             "The target language is given in square brackets. "
             "Output ONLY the translation: no quotes, no explanation, and NEVER "
             "any acknowledgment or conversational prefix such as '好的' or '收到'.\n"
@@ -319,10 +333,11 @@ class ArkTranslator:
             user = (
                 f"Recent meeting context for reference only, do NOT translate it:\n"
                 f"{ctx}\n\n"
-                f"Now translate this sentence into {target_lang}, output ONLY the translation:\n{text}"
+                f"Now translate this sentence from {source_lang} into {target_lang}, "
+                f"output ONLY the translation:\n{text}"
             )
         else:
-            user = f"[{target_lang}] {text}"
+            user = f"[{source_lang}->{target_lang}] {text}"
 
         async def create(tier: str):
             extra_body = {"thinking": {"type": "disabled"}}

@@ -106,6 +106,10 @@
   .trans.provisional { color: var(--draft-tail); font-style: italic; }  /* draft promoted, refined pending */
   .trans.fallback { color: var(--ink-3); }
   body.single .orig { display: none; }
+  .direction-tag {
+    margin-right: 8px; color: var(--ink-3); font: 600 10px/1 var(--sans);
+    letter-spacing: .08em; white-space: nowrap;
+  }
 
   /* live strip: hearing (1 line, tail-anchored spot-check) + draft (3
      lines, top-anchored reading surface). Heights follow the font-size
@@ -599,7 +603,11 @@ function makeTurn(ev) {
   const body = document.createElement('div');
   const orig = document.createElement('p');
   orig.className = 'orig';
-  orig.textContent = ev.source;
+  const direction = document.createElement('span');
+  direction.className = 'direction-tag';
+  const targetLang = ev.target_lang || (ev.lang === 'zh' ? 'en' : 'zh');
+  direction.textContent = `${ev.lang === 'zh' ? '中' : String(ev.lang).toUpperCase()}→${targetLang === 'zh' ? '中' : String(targetLang).toUpperCase()}`;
+  orig.append(direction, document.createTextNode(ev.source));
   if (ev.misrec) {
     // lid said English but text came out Chinese: mark it, the refined
     // translation below carries the recovered content
@@ -787,7 +795,8 @@ async function playTurn(ev, id, ts) {
   renderDraft(ev.draft);
   await dsleep(500);
   hearing.textContent = ''; clearDraft();
-  const committed = {id, lang: ev.lang, source: src, speaker: ev.sp, ts};
+  const committed = {id, lang: ev.lang,
+    target_lang: ev.lang === 'zh' ? 'en' : 'zh', source: src, speaker: ev.sp, ts};
   if (!seenIds.has(id)) history.push(committed);
   appendSentence(committed);
   await dsleep(250);

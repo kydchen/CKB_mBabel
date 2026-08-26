@@ -22,6 +22,7 @@ import shutil
 import signal
 import sys
 import time
+import unicodedata
 import wave
 import webbrowser
 from collections import Counter, deque
@@ -323,6 +324,48 @@ def trim_hotwords(entries: list[tuple[str, int]], limit: int = 100
 
 
 LATIN_RE = re.compile(r"[A-Za-z]")
+LANGUAGE_PAIRS = ("zh-en", "en-vi", "zh-vi")
+PAIR_LANGS = {
+    "zh-en": ("zh", "en"),
+    "en-vi": ("en", "vi"),
+    "zh-vi": ("zh", "vi"),
+}
+VI_MARKS = frozenset("\u0300\u0301\u0302\u0303\u0306\u0309\u031b\u0323")
+
+
+def normalize_pair(pair: str | None) -> str:
+    value = (pair or "zh-en").strip().lower()
+    if value not in LANGUAGE_PAIRS:
+        raise ValueError(
+            f"BABEL_PAIR must be one of {', '.join(LANGUAGE_PAIRS)}; got {value!r}"
+        )
+    return value
+
+
+def normalize_asr_language(tag: str | None) -> str | None:
+    if not tag:
+        return None
+    return tag.strip().lower().split("-", 1)[0].split("_", 1)[0] or None
+
+
+def looks_vietnamese(text: str) -> bool:
+    if "đ" in text.casefold():
+        return True
+    return any(char in VI_MARKS for char in unicodedata.normalize("NFD", text))
+
+
+def resolve_direction(text: str, pair: str, detected: str | None = None
+                      ) -> tuple[str, str, str, str]:
+    """Return (source, target, detected language, evidence source)."""
+    if pair == "zh-en":
+        source, target = detect_direction(text)
+        return source, target, source, "fallback"
+    language = normalize_asr_language(detected)
+    lang_source = "asr" if language else "fallback"
+    if not language:
+        language = "vi" if looks_vietnamese(text) else PAIR_LANGS[pair][0]
+    target = PAIR_LANGS[pair][0] if language == "vi" else "vi"
+    return language, target, language, lang_source
 
 
 def detect_direction(text: str) -> tuple[str, str]:
@@ -1366,6 +1409,8 @@ async def run(args) -> None:
     if not args.no_ui and reopen_existing_session(args.port):
         return
 
+    session_pair = {"value": normalize_pair(getattr(args, "pair", None))}
+
     run_task = asyncio.current_task()
     assert run_task is not None
     cleanup_started = {"v": False}
@@ -1383,32 +1428,10 @@ async def run(args) -> None:
         run_task.cancel()
 
     glossary = Glossary.load(args.glossary)
-    # Merge hotword files: English/proper nouns become identity translation
-    # terms (kept as-is, e.g. "Meepo"), Chinese entries only feed ASR.
-    # ASR hotword priority comes from #priority sections; glossary-only terms
-    # are the lowest tier, so the 100-token cap preserves curated names.
-    file_entries = load_hotwords_dir(args.hotwords_dir)
-    file_words = [word for word, _priority in file_entries]
-    sources = {t["source"] for t in glossary.terms}
-    for word in file_words:
-        if word not in sources:
-            if not CJK_RE.search(word):
-                glossary.terms.append({"source": word, "target": word})
-            sources.add(word)
-    priorities: dict[str, int] = {}
-    for word, priority in file_entries + [(t["source"], -1) for t in glossary.terms]:
-        priorities[word] = max(priority, priorities.get(word, -1))
-    hotwords_all = list(priorities)
-    identity_terms = {
-        t["source"] for t in glossary.terms
-        if (t.get("source") or "").strip().casefold()
-        == (t.get("target") or "").strip().casefold()
-    }
+    hotwords_all: list[str] = []
 
-    # Split hotwords into two channels: direct transmission (cap 100 tokens,
-    # for table-incompatible entries and English proper nouns) and a
-    # 自学习平台 boosting table (thousands of entries, but strict format:
-    # <10 chars, no punctuation, digits written as Chinese characters).
+    # Split zh-en hotwords into direct transmission (100-token cap) and the
+    # speech console table. Multilingual ASR forbids both corpus channels.
     DIGITS = str.maketrans("0123456789", "零一二三四五六七八九")
 
     def table_form(word: str) -> str | None:
@@ -1419,34 +1442,61 @@ async def run(args) -> None:
             return None
         return w
 
-    table_words: list[str] = []
-    incompatible: list[str] = []
-    for w in hotwords_all:
-        tf = table_form(w)
-        if tf is None:
-            incompatible.append(w)
-        else:
-            table_words.append(tf)
-    direct_candidates = list(dict.fromkeys(
-        incompatible + [w for w in hotwords_all
-                        if table_form(w) is not None and not CJK_RE.search(w)]
-    ))
-    direct, dropped, direct_tokens = trim_hotwords(
-        [(word, priorities[word]) for word in direct_candidates]
-    )
-    if dropped:
-        print(f"[hotwords] direct budget: {direct_tokens}/100 estimated tokens "
-              f"across {len(direct)} terms; dropped {len(dropped)} terms after "
-              f"priority ordering: {', '.join(dropped)}")
-    table_words = list(dict.fromkeys(table_words))
-    table_path = os.path.join(args.hotwords_dir, "boosting_table.txt")
-    with open(table_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(table_words) + "\n")
-    boosting_table_id = os.environ.get("VOLC_BOOSTING_TABLE_ID")
-    if not boosting_table_id:
-        print(f"[hotwords] {len(table_words)} table-format words at "
-              f"{os.path.normpath(table_path)}; upload in speech console 自学习平台 "
-              f"and set VOLC_BOOSTING_TABLE_ID to activate zh hotwords")
+    def zh_hotword_config(*, merge_terms: bool) -> tuple[list[str], str | None]:
+        file_entries = load_hotwords_dir(args.hotwords_dir)
+        if merge_terms:
+            sources = {t["source"] for t in glossary.terms}
+            for word, _priority in file_entries:
+                if word not in sources:
+                    if not CJK_RE.search(word):
+                        glossary.terms.append({"source": word, "target": word})
+                    sources.add(word)
+        priorities: dict[str, int] = {}
+        for word, priority in file_entries + [
+            (t["source"], -1) for t in glossary.terms
+        ]:
+            priorities[word] = max(priority, priorities.get(word, -1))
+        hotwords_all[:] = priorities
+        table_words: list[str] = []
+        incompatible: list[str] = []
+        for word in hotwords_all:
+            table_word = table_form(word)
+            (incompatible if table_word is None else table_words).append(
+                word if table_word is None else table_word
+            )
+        direct_candidates = list(dict.fromkeys(
+            incompatible + [word for word in hotwords_all
+                            if table_form(word) is not None
+                            and not CJK_RE.search(word)]
+        ))
+        direct, dropped, direct_tokens = trim_hotwords(
+            [(word, priorities[word]) for word in direct_candidates]
+        )
+        if dropped:
+            print(f"[hotwords] direct budget: {direct_tokens}/100 estimated tokens "
+                  f"across {len(direct)} terms; dropped {len(dropped)} terms after "
+                  f"priority ordering: {', '.join(dropped)}")
+        table_words = list(dict.fromkeys(table_words))
+        table_path = os.path.join(args.hotwords_dir, "boosting_table.txt")
+        with open(table_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(table_words) + "\n")
+        boosting_id = os.environ.get("VOLC_BOOSTING_TABLE_ID")
+        if not boosting_id:
+            print(f"[hotwords] {len(table_words)} table-format words at "
+                  f"{os.path.normpath(table_path)}; upload in speech console 自学习平台 "
+                  f"and set VOLC_BOOSTING_TABLE_ID to activate zh hotwords")
+        return direct, boosting_id
+
+    if session_pair["value"] == "zh-en":
+        direct, boosting_table_id = zh_hotword_config(merge_terms=True)
+    else:
+        direct, boosting_table_id = [], None
+        print("[hotwords] hotwords disabled in multilingual mode")
+    identity_terms = {
+        t["source"] for t in glossary.terms
+        if (t.get("source") or "").strip().casefold()
+        == (t.get("target") or "").strip().casefold()
+    }
 
     # ASR correction map: fix systematic mishearings (e.g. MATE -> Matt,
     # CKC -> CKCon) client-side before display and translation. Rebuildable
@@ -1495,6 +1545,9 @@ async def run(args) -> None:
             "console. With old-console app credentials, use --translator ark."
         )
     translator = build_translator(args.translator, glossary, model=args.model)
+    vi_fast_translator = {
+        "engine": translator if args.translator == "volc-mt" else None
+    }
 
     ui: CaptionUI | None = None
     tunnel_proc = None
@@ -1516,6 +1569,7 @@ async def run(args) -> None:
                 f"[ui] Caption port {args.port} is unavailable; mBabel did not "
                 f"start. Use --port to choose another port. ({e})"
             ) from e
+        await ui.set_pair(session_pair["value"])
         url = f"http://127.0.0.1:{ui.port}{suffix}"
         try:
             register_session(ui.port, url)
@@ -1570,6 +1624,7 @@ async def run(args) -> None:
             hotwords=direct,
             boosting_table_id=boosting_table_id,
             end_window_size=args.end_window,
+            pair=session_pair["value"],
         )
     )
 
@@ -1702,6 +1757,44 @@ async def run(args) -> None:
                     "fast" if bool(msg.get("enabled")) else "default"
                 )
             await emit_ark_tier_state()
+        elif kind == "pair_get":
+            if ui:
+                await ui.set_pair(session_pair["value"])
+        elif kind == "pair":
+            try:
+                requested_pair = normalize_pair(msg.get("pair"))
+            except ValueError:
+                return
+            if requested_pair != session_pair["value"]:
+                if line_parts:
+                    await flush_line()
+                session_pair["value"] = requested_pair
+                asr.config.set_pair(requested_pair)
+                if requested_pair == "zh-en":
+                    zh_direct, zh_table = zh_hotword_config(merge_terms=False)
+                    asr.config.hotwords = zh_direct
+                    asr.config.boosting_table_id = zh_table
+                else:
+                    asr.config.hotwords = []
+                    asr.config.boosting_table_id = None
+                    print("[hotwords] hotwords disabled in multilingual mode")
+                for task in draft_tasks:
+                    task.cancel()
+                draft_tasks.clear()
+                last_live_line["text"] = ""
+                reconnect_partial["text"] = ""
+                last_draft.update(text="")
+                last_draft_result.update(text="", source="", src="", time=0.0)
+                replay_audio.clear()
+                sent_audio_tail.clear()
+                committed.clear()
+                recent_context.clear()
+                print(f"[asr] pair={requested_pair}; restarting session")
+                if ui:
+                    await ui.set_pair(requested_pair)
+                    await ui.emit({"type": "status",
+                                   "text": f"{requested_pair}, ASR restarting…"})
+                await asr.close()
         elif kind == "ddc":
             enabled = bool(msg.get("enabled"))
             if asr.config.enable_ddc != enabled:
@@ -1783,7 +1876,7 @@ async def run(args) -> None:
     committed: set[tuple[int, int, str]] = set()
     translate_tasks: list[asyncio.Task] = []
     draft_tasks: list[asyncio.Task] = []  # cancelled on flush: finals have priority
-    cache: dict[str, str] = {}
+    cache: dict[tuple[str, str], str] = {}
     recent_context: deque[dict] = deque(maxlen=4)
     last_committed = {"text": ""}
     last_live_line = {"text": ""}
@@ -1882,6 +1975,8 @@ async def run(args) -> None:
         newer than what is on screen is shown, even if a newer one is
         already in flight; this keeps the draft cadence at translation
         speed instead of collapsing to sentence end."""
+        if session_pair["value"] != "zh-en":
+            return
         try:
             src, tgt = detect_direction(text)
             req_stats["volc_draft"].append(time.time())
@@ -1901,48 +1996,77 @@ async def run(args) -> None:
             await ui.emit({"type": "draft", "text": translated, "lang": src})
 
     async def commit(text: str, seg_id: int, speaker: str | None,
-                     misrec: bool = False, draft_snap: dict | None = None) -> None:
-        src, tgt = detect_direction(text)
-        arrow = "中→英" if src == "zh" else "EN→中"
+                     misrec: bool = False, draft_snap: dict | None = None,
+                     sentence_pair: str = "zh-en",
+                     detected_lang: str | None = None) -> None:
+        src, tgt, detected, lang_source = resolve_direction(
+            text, sentence_pair, detected_lang
+        )
+        arrow = f"{src.upper()}→{tgt.upper()}"
         ts = round(time.time() - session_t0, 1)
         if ui:
             await ui.emit({"type": "committed", "id": seg_id, "lang": src,
                            "source": text, "speaker": speaker, "ts": ts,
-                           "misrec": misrec})
+                           "misrec": misrec, "target_lang": tgt,
+                           "pair": sentence_pair, "detected_lang": detected,
+                           "lang_source": lang_source})
 
         # W1 draft promotion: a sufficiently complete draft of THIS sentence
         # becomes the ≈ provisional translation until the refined pass lands.
         provisional = None
-        ld = draft_snap or {"text": "", "source": "", "src": "", "time": 0.0}
-        coverage = len(ld.get("source", "")) / len(text)
-        if (ld["text"] and ld["src"] == src
-                and time.time() - ld["time"] < 3.0
-                and 0.6 <= coverage <= 1.4
-                and accept_translation(text, ld["text"], tgt, seg_id,
-                                       "provisional", "draft")):
-            provisional = ld["text"]
+        if sentence_pair != "zh-en":
+            try:
+                if vi_fast_translator["engine"] is None:
+                    vi_fast_translator["engine"] = build_translator(
+                        "volc-mt", glossary
+                    )
+                fast_engine = vi_fast_translator["engine"]
+                req_stats["volc_draft"].append(time.time())
+                candidate = await fast_engine.translate(text, src, tgt, lite=True)
+                if accept_translation(text, candidate, tgt, seg_id,
+                                      "provisional", "volc-mt"):
+                    provisional = candidate
+            except Exception as e:
+                key = type(e).__name__
+                fail_stats[key] = fail_stats.get(key, 0) + 1
+                print(f"[translate] multilingual provisional failed: {e}",
+                      file=sys.stderr)
+        else:
+            ld = draft_snap or {"text": "", "source": "", "src": "", "time": 0.0}
+            coverage = len(ld.get("source", "")) / len(text)
+            if (ld["text"] and ld["src"] == src
+                    and time.time() - ld["time"] < 3.0
+                    and 0.6 <= coverage <= 1.4
+                    and accept_translation(text, ld["text"], tgt, seg_id,
+                                           "provisional", "draft")):
+                provisional = ld["text"]
+        if provisional is not None:
             if ui:
                 await ui.emit({"type": "translation", "id": seg_id,
                                "text": provisional, "provisional": True})
 
-        ctx = [dict(item) for item in recent_context]
-        context_entry = {"seq": seg_id, "source_lang": src, "source": text,
-                         "translation": provisional or ""}
+        ctx = [dict(item) for item in recent_context
+               if item.get("pair", "zh-en") == sentence_pair]
+        context_entry = {"seq": seg_id, "source_lang": src,
+                         "target_lang": tgt, "source": text,
+                         "translation": provisional or "", "pair": sentence_pair}
         recent_context.append(context_entry)
         # refined pass: ark with the previous sentences as context (default
         # since W1); volc-mt stays as fallback when ark credentials are absent
         translated = None
         translation_outcome = "unavailable"
-        if provisional is not None and hotword_token_cost(text) <= 6:
+        cache_key = (sentence_pair, text)
+        if (sentence_pair == "zh-en" and provisional is not None
+                and hotword_token_cost(text) <= 6):
             translated = provisional
             translation_outcome = "provisional"
-        elif text in cache and accept_translation(
-            text, cache[text], tgt, seg_id, "cache", "cache"
+        elif cache_key in cache and accept_translation(
+            text, cache[cache_key], tgt, seg_id, "cache", "cache"
         ):
-            translated = cache[text]
+            translated = cache[cache_key]
             translation_outcome = "cache"
         else:
-            cache.pop(text, None)  # never retain a pre-gate or corrupted value
+            cache.pop(cache_key, None)  # never retain a pre-gate or corrupted value
             engine = ark_polisher if ark_polisher is not None else translator
             translated = await request_refined(
                 engine, text, src, tgt, ctx, seg_id, "final"
@@ -1975,7 +2099,7 @@ async def run(args) -> None:
                     )
                 )
             else:
-                cache[text] = translated  # never cache the failure placeholder
+                cache[cache_key] = translated  # never cache the failure placeholder
         if not translated.startswith("⚠ "):
             context_entry["translation"] = translated
         if ui and translated != provisional:
@@ -1985,6 +2109,8 @@ async def run(args) -> None:
         timing = refined_meta.get(seg_id, {})
         record = {"seq": seg_id, "speaker": speaker, "lang": src,
                   "source": text, "translation": translated,
+                  "pair": sentence_pair, "detected_lang": detected,
+                  "lang_source": lang_source,
                   "language_conflict": bool(misrec),
                   "translation_outcome": translation_outcome,
                   "refined_latency_ms": timing.get("refined_latency_ms"),
@@ -2023,7 +2149,8 @@ async def run(args) -> None:
                     outcome = f"{engine_label(translator)}_fallback_backfill"
             if fixed is None:
                 continue
-            cache[text] = fixed
+            sentence_pair = context_entry.get("pair", session_pair["value"])
+            cache[(sentence_pair, text)] = fixed
             context_entry["translation"] = fixed
             if ui:
                 await ui.emit({"type": "translation", "id": seg_id, "text": fixed})
@@ -2065,7 +2192,10 @@ async def run(args) -> None:
         seg_seq += 1
         last_committed["text"] = text
         translate_tasks.append(
-            asyncio.create_task(commit(text, seg_seq, speaker, misrec, draft_snap)))
+            asyncio.create_task(commit(
+                text, seg_seq, speaker, misrec, draft_snap,
+                sentence_pair=session_pair["value"]
+            )))
 
     async def silence_watchdog() -> None:
         """Flush the live line when the ASR has been quiet for a while; real
@@ -2145,6 +2275,16 @@ async def run(args) -> None:
                                 if is_replay_duplicate(frag, replay_guard["previous"]):
                                     print(f"[asr] skipped replayed fragment after reconnect: {frag}")
                                     continue
+                            active_pair = session_pair["value"]
+                            if active_pair != "zh-en":
+                                additions = utt.get("additions") or {}
+                                seg_seq += 1
+                                last_committed["text"] = frag
+                                translate_tasks.append(asyncio.create_task(commit(
+                                    frag, seg_seq, "0", sentence_pair=active_pair,
+                                    detected_lang=additions.get("language")
+                                )))
+                                continue
                             if reconnect_partial["text"]:
                                 frag = merge_reconnect_partial(
                                     reconnect_partial["text"], frag
@@ -2199,7 +2339,8 @@ async def run(args) -> None:
                         debounce = 2.5 if streak >= 2 else 0.6
                         grown = len(text) - len(last_draft["text"])
                         due = now - last_draft["time"]
-                        if (ui and len(text) >= 4 and text != last_draft["text"]
+                        if (ui and session_pair["value"] == "zh-en"
+                                and len(text) >= 4 and text != last_draft["text"]
                                 and (grown >= 6 or due >= 2.0)
                                 and due >= debounce):
                             last_draft.update(text=text, time=now)
@@ -2207,7 +2348,7 @@ async def run(args) -> None:
                             draft_tasks.append(
                                 asyncio.create_task(draft_translate(text, draft_seq))
                             )
-                        if ui:
+                        if ui and session_pair["value"] == "zh-en":
                             await ui.emit({"type": "interim", "text": line})
                         if args.no_ui and event.text:
                             sys.stdout.write(f"{CLEAR_LINE}{DIM}… {line}{RESET}")
@@ -2247,7 +2388,7 @@ async def run(args) -> None:
                 break
             reconnects += 1
             announced_connected = False
-            if last_live_line["text"]:
+            if session_pair["value"] == "zh-en" and last_live_line["text"]:
                 reconnect_partial["text"] = last_live_line["text"]
                 line_parts.clear()
                 print(f"[asr] preserved interim across reconnect: "
@@ -2305,7 +2446,12 @@ async def run(args) -> None:
                 print_safe(f"[corrections] cannot persist: {e}", file=sys.stderr)
         if transcript_records:
             md_path = jsonl_path.replace(".jsonl", ".md")
-            lines = [f"# Babel transcript {stamp}\n\n"]
+            used_pairs = list(dict.fromkeys(
+                record.get("pair", "zh-en") for record in transcript_records
+            ))
+            pair_label = (used_pairs[0] if len(used_pairs) == 1
+                          else f"mixed ({', '.join(used_pairs)})")
+            lines = [f"# Babel transcript {stamp}\n\nPair: {pair_label}\n\n"]
             for r in transcript_records:
                 who = (f"Speaker {int(r['speaker']) + 1}"
                        if r["speaker"] is not None and str(r["speaker"]).isdigit()
@@ -2414,6 +2560,10 @@ def main() -> None:
     if args.audio_config == audio_config:
         migrate_audio_config(audio_config)
     load_dotenv(args.env)
+    try:
+        args.pair = normalize_pair(os.environ.get("BABEL_PAIR", "zh-en"))
+    except ValueError as e:
+        parser.error(str(e))
     try:
         asyncio.run(run(args))
     finally:

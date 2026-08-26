@@ -2,10 +2,9 @@
 
 Protocol reference: https://docs.volcengine.com/docs/6561/1354869
 
-Uses the optimized bidirectional streaming endpoint (bigmodel_async) with
-two-pass recognition (enable_nonstream): interim results arrive fast, and
-each VAD-closed segment is re-recognized by the non-streaming model for
-accuracy, marked with "definite": true in the utterances list.
+The zh-en profile uses the optimized bidirectional streaming endpoint
+(bigmodel_async) with two-pass recognition. Vietnamese profiles use the
+auto-language nostream endpoint and yield sentence-final results only.
 """
 
 from __future__ import annotations
@@ -21,6 +20,8 @@ from typing import AsyncIterator
 import websockets
 
 ENDPOINT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+MULTILINGUAL_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream"
+LANGUAGE_PAIRS = ("zh-en", "en-vi", "zh-vi")
 
 # Binary protocol nibbles (see the doc's protocol table).
 PROTOCOL_VERSION = 0x1
@@ -63,7 +64,8 @@ class AsrConfig:
     access_key: str | None = None  # old console: Access Token (X-Api-Access-Key)
     resource_id: str = "volc.seedasr.sauc.duration"  # Seed-ASR 2.0, hourly billing
     boosting_table_id: str | None = None  # 自学习平台热词表, lifts the 100-token direct cap
-    endpoint: str = ENDPOINT
+    endpoint: str | None = None
+    pair: str = "zh-en"
     hotwords: list[str] = field(default_factory=list)
     enable_nonstream: bool = True  # two-pass: fast interim + accurate definite
     enable_speaker_info: bool = True  # speaker clustering, needs nonstream + ssd 200
@@ -72,6 +74,15 @@ class AsrConfig:
     end_window_size: int = 800  # ms of silence that closes a segment
     enable_ddc: bool = False  # disfluency smoothing
     uid: str = "babel"
+
+    def __post_init__(self) -> None:
+        self.set_pair(self.pair)
+
+    def set_pair(self, pair: str) -> None:
+        if pair not in LANGUAGE_PAIRS:
+            raise ValueError(f"unsupported language pair: {pair}")
+        self.pair = pair
+        self.endpoint = ENDPOINT if pair == "zh-en" else MULTILINGUAL_ENDPOINT
 
 
 @dataclass
@@ -92,7 +103,9 @@ def _build_full_request(config: AsrConfig) -> bytes:
             "bits": 16,
             "channel": 1,
         },
-        "request": {
+    }
+    if config.pair == "zh-en":
+        payload["request"] = {
             "model_name": "bigmodel",
             "enable_punc": True,
             "enable_itn": True,
@@ -104,16 +117,25 @@ def _build_full_request(config: AsrConfig) -> bytes:
             "show_utterances": True,
             "result_type": "single",
             "enable_ddc": config.enable_ddc,
-        },
-    }
-    corpus: dict = {}
-    if config.hotwords:
-        hotwords = [{"word": w} for w in config.hotwords]
-        corpus["context"] = json.dumps({"hotwords": hotwords}, ensure_ascii=False)
-    if config.boosting_table_id:
-        corpus["boosting_table_id"] = config.boosting_table_id
-    if corpus:
-        payload["request"]["corpus"] = corpus
+        }
+        corpus: dict = {}
+        if config.hotwords:
+            hotwords = [{"word": w} for w in config.hotwords]
+            corpus["context"] = json.dumps({"hotwords": hotwords}, ensure_ascii=False)
+        if config.boosting_table_id:
+            corpus["boosting_table_id"] = config.boosting_table_id
+        if corpus:
+            payload["request"]["corpus"] = corpus
+    else:
+        payload["request"] = {
+            "model_name": "bigmodel",
+            "enable_punc": True,
+            "enable_speaker_info": True,
+            "enable_auto_lang": True,
+            "end_window_size": config.end_window_size,
+            "show_utterances": True,
+            "result_type": "single",
+        }
     body = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     return (
         _header(MSG_FULL_CLIENT_REQUEST, FLAG_NONE, SER_JSON, COMP_GZIP)

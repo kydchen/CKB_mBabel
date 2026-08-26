@@ -440,6 +440,9 @@ class DummyUI:
     async def set_share(self, lan, public):
         pass
 
+    async def set_pair(self, pair):
+        self.events.append({"type": "pair_state", "pair": pair})
+
 
 class BindFailUI(DummyUI):
     async def start(self):
@@ -458,6 +461,7 @@ def make_args(temp_dir, wav):
         share=False,
         port=8765,
         end_window=800,
+        pair="zh-en",
     )
 
 

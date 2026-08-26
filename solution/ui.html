@@ -140,6 +140,12 @@
   .trans.provisional { color: var(--draft-tail); font-style: italic; }  /* draft promoted, refined pending */
   .trans.fallback { color: var(--ink-3); }
   body.single .orig { display: none; }
+  .direction-tag {
+    margin-right: 8px; color: var(--ink-3); font: 600 10px/1 var(--sans);
+    letter-spacing: .08em; white-space: nowrap;
+  }
+  body.multilingual .who .name { visibility: hidden; pointer-events: none; }
+  body.multilingual .speaker-ui { display: none; }
 
   /* live strip: hearing (1 line, tail-anchored spot-check) + draft (3
      lines, top-anchored reading surface). Heights follow the font-size
@@ -200,6 +206,12 @@
   #drafting.on::after {
     content: '▌'; color: var(--accent); animation: breathe 1.1s infinite;
     font-family: var(--sans); font-size: calc(var(--fs-draft) * .8);
+  }
+  body.multilingual .live .inner { display: block; min-height: 28px; }
+  body.multilingual .live .inner > * { display: none; }
+  body.multilingual .live .inner::before {
+    content: '等待整句 waiting for sentence…'; color: var(--ink-3);
+    font-size: 12.5px; letter-spacing: .04em;
   }
 
   #follow-btn {
@@ -434,6 +446,16 @@
     <button class="hbtn lang-flip">EN</button>
     <h2>声音设备 Audio devices</h2>
     <div class="device-row">
+      <label for="pair-select"><span class="zh">会议语言</span><span class="en">Meeting languages</span></label>
+      <select id="pair-select" disabled>
+        <option value="zh-en">中 ↔ English</option>
+        <option value="en-vi">English ↔ Tiếng Việt</option>
+        <option value="zh-vi">中 ↔ Tiếng Việt</option>
+      </select>
+      <p class="device-help zh">越南语模式按整句出字，无热词和说话人分离；术语依赖纠错表与翻译术语表。</p>
+      <p class="device-help en">Vietnamese modes caption whole sentences, without hotwords or speaker separation; terminology relies on corrections and the translation glossary.</p>
+    </div>
+    <div class="device-row">
       <label for="mic-select"><span class="zh">麦克风</span><span class="en">Microphone</span></label>
       <select id="mic-select"></select>
     </div>
@@ -495,6 +517,7 @@
     <h3>格式 Format</h3>
     <label><input type="radio" name="exp-fmt" value="md" checked> Markdown .md</label>
     <label><input type="radio" name="exp-fmt" value="srt"> 字幕文件 SRT .srt</label>
+    <div class="speaker-ui">
     <h3>Speaker 命名 Speaker names</h3>
     <p class="zh" style="color:var(--ink-3);font-size:13px">点名字,主屏会跳到并高亮 TA 说过的句子,方便确认是谁。浮窗不会关闭。</p>
     <p class="en" style="color:var(--ink-3);font-size:13px">Click a name to jump to and highlight their lines behind this dialog.</p>
@@ -506,6 +529,7 @@
       <p class="pool-note zh">删除只会移除下次可选的名字,不会改写本场字幕。</p>
       <p class="pool-note en">Deleting a saved name only removes the suggestion; it does not change this meeting.</p>
       <div id="pool-rows"></div>
+    </div>
     </div>
     <button id="export-go">下载 .md Download</button>
   </div>
@@ -536,6 +560,7 @@ const transById = {};      // id -> translation
 const seenIds = new Set();
 const sessionNames = {};   // speaker id -> name (this page session)
 let sessionEnded = false;  // deliberate end: suppress the reconnect loop
+let sessionPair = 'zh-en';
 const SPCOLORS = ['#3D5A80','#5A7247','#A9752F','#7B4B67','#4E616C','#8C5040'];
 
 // keep --strip-h in sync so the follow button always floats just above the
@@ -616,6 +641,30 @@ function renderDraft(text) {
   draftBoxEl.classList.toggle('overflow', draftBoxEl.scrollTop > 0);
 }
 function currentView() { return document.getElementById('view-sel').value; }
+function multilingualPair() { return sessionPair !== 'zh-en'; }
+function languageLabel(lang) { return lang === 'zh' ? '中' : String(lang || '').toUpperCase(); }
+function applyPair(pair) {
+  if (!['zh-en', 'en-vi', 'zh-vi'].includes(pair)) return;
+  sessionPair = pair;
+  document.body.classList.toggle('multilingual', multilingualPair());
+  document.getElementById('session-meta').textContent = pair === 'zh-en'
+    ? '中英双语字幕' : pair.toUpperCase().replace('-', ' ↔ ');
+  const oldView = viewSel.value;
+  const options = multilingualPair()
+    ? [['both', '原译对照 Both'], ['original', '原文 Original'], ['translation', '译文 Translation']]
+    : [['both', '双语对照 Both'], ['zh', '中文 zh'], ['en', 'English']];
+  viewSel.textContent = '';
+  for (const [value, label] of options) {
+    const option = document.createElement('option');
+    option.value = value; option.textContent = label; viewSel.appendChild(option);
+  }
+  viewSel.value = options.some(([value]) => value === oldView)
+    ? oldView : (multilingualPair() && oldView !== 'both' ? 'translation' : 'both');
+  document.getElementById('pair-select').value = pair;
+  hearing.textContent = '';
+  clearDraft();
+  applyPrefs();
+}
 
 // ---- prefs: view, font size, theme ----
 const viewSel = document.getElementById('view-sel');
@@ -655,6 +704,8 @@ document.getElementById('pres-exit').onclick = () => { fsSel.value = 'm'; applyP
 // ---- sentence rendering ----
 function transTextFor(ev) {
   const v = currentView();
+  if (v === 'original') return ev.source;
+  if (v === 'translation') return transById[ev.id] || null;
   if (v !== 'both' && ev.lang === v) return ev.source;  // my language: read the original
   return transById[ev.id] || null;
 }
@@ -728,7 +779,10 @@ function makeTurn(ev) {
   const body = document.createElement('div');
   const orig = document.createElement('p');
   orig.className = 'orig';
-  orig.textContent = ev.source;
+  const direction = document.createElement('span');
+  direction.className = 'direction-tag';
+  direction.textContent = `${languageLabel(ev.lang)}→${languageLabel(ev.target_lang)}`;
+  orig.append(direction, document.createTextNode(ev.source));
   if (ev.misrec) {
     // lid said English but text came out Chinese: mark it, the refined
     // translation below carries the recovered content
@@ -761,7 +815,8 @@ function appendSentence(ev) {
   // single-language fallback: translation missing 20s after commit -> show
   // the source dimmed instead of a permanent placeholder
   setTimeout(() => {
-    if (!transById[ev.id] && currentView() !== 'both' && ev.lang !== currentView()) {
+    if (!transById[ev.id] && currentView() !== 'both'
+        && currentView() !== 'original' && ev.lang !== currentView()) {
       const tr = turn.querySelector('.trans');
       tr.classList.remove('pending');
       tr.classList.add('fallback');
@@ -776,6 +831,7 @@ function addTranslation(ev) {
   if (!turn) return;
   const orig = history.find(e => e.id === ev.id);
   const tr = turn.querySelector('.trans');
+  if (currentView() === 'original') return;
   if (orig && currentView() !== 'both' && orig.lang === currentView()) return; // shows source
   tr.classList.remove('pending');
   tr.classList.remove('fallback');
@@ -844,6 +900,7 @@ function connect() {
     stopLabStats();
     controlToken = null;
     document.getElementById('device-btn').style.display = 'none';
+    document.getElementById('pair-select').disabled = true;
     pauseBtn.hidden = true;
     endBtn.hidden = true;
     if (sessionEnded) {  // deliberate end: keep the page for export, no retries
@@ -871,10 +928,12 @@ function connect() {
       appendSentence(ev);
     }
     else if (ev.type === 'translation') addTranslation(ev);
+    else if (ev.type === 'pair_state') applyPair(ev.pair);
     else if (ev.type === 'share') onShare(ev);
     else if (ev.type === 'control_token') {
       controlToken = ev.token;
       document.getElementById('device-btn').style.display = '';
+      document.getElementById('pair-select').disabled = false;
       pauseBtn.hidden = false;
       endBtn.hidden = false;
       pauseBtn.disabled = false;
@@ -883,6 +942,7 @@ function connect() {
       wsSend({type: 'pause_get'});
       wsSend({type: 'candidates_get'});
       wsSend({type: 'ark_tier_get'});
+      wsSend({type: 'pair_get'});
     }
     else if (ev.type === 'devices') onDevices(ev);
     else if (ev.type === 'pause_state') {
@@ -995,6 +1055,7 @@ document.getElementById('share-btn').onclick = () => {
 
 // ---- audio devices (host only) ----
 const deviceBtn = document.getElementById('device-btn');
+const pairSelect = document.getElementById('pair-select');
 const micSelect = document.getElementById('mic-select');
 const systemToggle = document.getElementById('system-toggle');
 const speakerSelect = document.getElementById('speaker-select');
@@ -1055,6 +1116,7 @@ endBtn.onclick = () => {
 micSelect.onchange = sendAudioSettings;
 systemToggle.onchange = sendAudioSettings;
 speakerSelect.onchange = sendAudioSettings;
+pairSelect.onchange = () => wsSend({type: 'pair', pair: pairSelect.value});
 
 // ---- meeting-language review (host only) ----
 function setCandidateActionsDisabled(disabled) {
@@ -1324,7 +1386,8 @@ document.getElementById('export-go').onclick = () => {
   if (renamed) renderAll();  // margin labels pick up the names live
   const kind = document.querySelector('input[name="exp-kind"]:checked').value;
   const fmt = document.querySelector('input[name="exp-fmt"]:checked').value;
-  const nameOf = (id) => id == null ? '' : (sessionNames[id] || 'Speaker ' + speakerNum(id));
+  const nameOf = (id) => multilingualPair() || id == null
+    ? '' : (sessionNames[id] || 'Speaker ' + speakerNum(id));
 
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
@@ -1351,7 +1414,9 @@ document.getElementById('export-go').onclick = () => {
     mime = 'application/x-subrip';
   } else {
     const kindZh = {original: '原文', translation: '译文', bilingual: '双语对照'}[kind];
-    md = `# mBabel 会议字幕 ${stamp}\n\n导出类型:${kindZh} · CKB mBabel\n\n`;
+    const usedPairs = [...new Set(history.map(ev => ev.pair || sessionPair))];
+    const pairLabel = usedPairs.length === 1 ? usedPairs[0] : `mixed (${usedPairs.join(', ')})`;
+    md = `# mBabel 会议字幕 ${stamp}\n\nPair: ${pairLabel} · 导出类型:${kindZh} · CKB mBabel\n\n`;
     for (const ev of history) {
       const who = nameOf(ev.speaker);
       const tag = who ? `**${who}**: ` : '';

@@ -10,8 +10,9 @@ Events:
 - {"type": "draft", "text": str}          live rough translation
 - {"type": "status", "text": str}         pipeline status (e.g. ASR reconnecting)
 - {"type": "share", "lan": str, "public": str}
+- {"type": "pair_state", "pair": "zh-en"|"en-vi"|"zh-vi"}
 - {"type": "devices", ...}                host-only audio device state
-- {"type": "committed", "id": int, "lang": "zh"|"en", "source": str, "speaker": str|None}
+- {"type": "committed", "id": int, "lang": "zh"|"en"|"vi", "source": str, "speaker": str|None}
 - {"type": "translation", "id": int, "text": str}
 """
 
@@ -39,6 +40,7 @@ class CaptionUI:
         self.control_clients: set[asyncio.Queue] = set()
         self.history: list[dict] = []  # replayed to late-joining browsers
         self.share: dict = {}  # {"lan": url, "public": url}, sent to every client
+        self.pair: str | None = None
         self.on_control = None  # async callback for UI control messages
         # Control token: required on every control message. It is printed to
         # the local terminal and injected into the page ONLY for direct
@@ -50,6 +52,10 @@ class CaptionUI:
         self.share = {k: v for k, v in (("lan", lan), ("public", public)) if v}
         if self.share:
             await self.emit({"type": "share", **self.share})
+
+    async def set_pair(self, pair: str) -> None:
+        self.pair = pair
+        await self.emit({"type": "pair_state", "pair": pair})
 
     async def start(self) -> None:
         html = open(HTML_PATH, encoding="utf-8").read().encode("utf-8")
@@ -93,6 +99,10 @@ class CaptionUI:
                 if self.share:
                     await ws.send(json.dumps(
                         {"type": "share", **self.share}, ensure_ascii=False))
+                if self.pair:
+                    await ws.send(json.dumps(
+                        {"type": "pair_state", "pair": self.pair},
+                        ensure_ascii=False))
                 for event in self.history:
                     await ws.send(json.dumps(event, ensure_ascii=False))
                 self.clients[outbox] = (task, ws)
