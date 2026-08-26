@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import json
 import os
+import struct
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,6 +58,27 @@ for pair in ("en-vi", "zh-vi"):
 assert request_payload("en-vi") == request_payload("zh-vi")
 
 
+def pcm(sample):
+    return struct.pack("<h", sample) * 32
+
+
+vu_state = {}
+vu_events = [babel.vu_event_for_chunk(pcm(sample), "en-vi", False,
+                                      vu_state, at)
+             for at, sample in ((0.0, 0), (0.10, 16384), (0.21, 16384),
+                                (0.30, 32767), (0.42, -32768))]
+vu_events = [event for event in vu_events if event]
+assert vu_events == [
+    {"type": "vu", "level": 0.0},
+    {"type": "vu", "level": 0.5},
+    {"type": "vu", "level": 1.0},
+]
+assert all(set(event) == {"type", "level"} and 0 <= event["level"] <= 1
+           for event in vu_events)
+assert babel.vu_event_for_chunk(pcm(16384), "zh-en", False, {}, 0.0) is None
+assert babel.vu_event_for_chunk(pcm(16384), "zh-vi", True, {}, 0.0) is None
+
+
 cases = {
     "zh": ("zh-CN", "今天讨论方案。"),
     "en": ("en-US", "We will discuss the proposal."),
@@ -91,6 +113,7 @@ assert translation_rejection_reason("hello", "你好", "zh") is None
 
 class UI:
     events = []
+    broadcasts = []
     instance = None
 
     def __init__(self, host, port, token=None):
@@ -104,6 +127,7 @@ class UI:
 
     async def emit(self, event):
         self.events.append(dict(event))
+        self.broadcasts.append(dict(event))
 
     async def emit_control(self, event):
         self.events.append(dict(event))
@@ -130,6 +154,7 @@ class SentenceAsr:
         await UI.instance.on_control({"type": "pair", "pair": "en-vi"})
         assert self.config.endpoint == asr_client.MULTILINGUAL_ENDPOINT
         assert request_payload(self.config.pair)["request"] == vi_expected
+        assert await anext(chunks)
         yield SimpleNamespace(
             text="",
             utterances=[{
@@ -174,7 +199,8 @@ async def pipeline_check(root):
         hotwords_dir=hotwords, translator="volc-mt", model=None,
         no_ui=False, share=False, port=8765, end_window=800, pair="zh-en",
     )
-    UI.events.clear(); FastTranslator.calls.clear(); RefinedTranslator.calls.clear()
+    UI.events.clear(); UI.broadcasts.clear()
+    FastTranslator.calls.clear(); RefinedTranslator.calls.clear()
     fast = FastTranslator(); refined = RefinedTranslator()
     with patch.object(babel, "__file__", os.path.join(root, "main.py")), \
          patch.object(babel, "SESSION_DIR", os.path.join(root, ".mbabel")), \
@@ -193,6 +219,8 @@ async def pipeline_check(root):
         "committed", "translation", "translation"
     ]
     assert captions[1].get("provisional") is True
+    vus = [event for event in UI.broadcasts if event["type"] == "vu"]
+    assert len(vus) == 1 and 0 <= vus[0]["level"] <= 1, vus
     assert not [event for event in UI.events
                 if event["type"] in ("draft", "interim")]
     transcript_dir = os.path.join(root, "transcripts")
@@ -209,4 +237,4 @@ os.environ["VOLC_ASR_API_KEY"] = "offline-test"
 with tempfile.TemporaryDirectory(prefix="mbabel-d9-") as root:
     asyncio.run(pipeline_check(root))
 
-print("D9: payloads, routing, VI gate, switch, and sentence pipeline pass")
+print("D9/D11: payloads, routing, VI gate, switch, liveness, and sentence pipeline pass")

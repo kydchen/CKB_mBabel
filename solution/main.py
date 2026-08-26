@@ -87,6 +87,7 @@ def load_hotwords_dir(path: str) -> list[tuple[str, int]]:
 SAMPLE_RATE = 16000
 CHUNK_MS = 200  # 200ms per packet is optimal for the bidirectional endpoint
 CHUNK_BYTES = SAMPLE_RATE * CHUNK_MS // 1000 * 2  # s16le mono
+VU_INTERVAL_S = 0.2
 RECONNECT_TAIL_CHUNKS = 3000 // CHUNK_MS
 REPLAY_GUARD_SECONDS = 10.0
 REPLAY_GUARD_FRAGMENTS = 5
@@ -438,6 +439,25 @@ def mix_pcm_s16(microphone: bytes, system: bytes) -> bytes:
         mixed = sample + (other[i] if i < len(other) else 0)
         out[i] = max(-32768, min(32767, mixed))
     return out.tobytes()
+
+
+def vu_event_for_chunk(data: bytes, pair: str, paused: bool,
+                       state: dict, now: float) -> dict | None:
+    """Return a throttled local volume event for fresh multilingual PCM."""
+    if pair == "zh-en" or paused:
+        return None
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(data[:len(data) // 2 * 2])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    level = ((sum(sample * sample for sample in samples) / len(samples)) ** 0.5
+             / 32768.0) if samples else 0.0
+    if now - state.get("last", float("-inf")) < VU_INTERVAL_S:
+        return None
+    state["last"] = now
+    return {"type": "vu", "level": round(min(1.0, level), 4)}
 
 
 _COREAUDIO = None
@@ -2218,6 +2238,7 @@ async def run(args) -> None:
     announced_connected = True  # flips False while disconnected
     sent_audio_tail = deque(maxlen=RECONNECT_TAIL_CHUNKS)
     replay_audio: list[bytes] = []
+    vu_state = {"last": float("-inf")}
 
     async def reconnect_chunks():
         while replay_audio:
@@ -2225,6 +2246,13 @@ async def run(args) -> None:
             sent_audio_tail.append(chunk)
             yield chunk
         async for chunk in chunk_iterator(queue):
+            if ui:
+                event = vu_event_for_chunk(
+                    chunk, session_pair["value"], paused["v"], vu_state,
+                    asyncio.get_running_loop().time(),
+                )
+                if event:
+                    await ui.emit(event)
             sent_audio_tail.append(chunk)
             yield chunk
 
