@@ -23,6 +23,12 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 - **Export**: Markdown or timestamped SRT — original, translation, or bilingual — with speaker names you type once and the browser remembers.
 - **Robust for long meetings**: ASR auto-reconnects with backoff, rate limits are classified and backed off (failed lines quietly backfill), language-misidentified sentences get a "mishearing?" marker, and the full transcript auto-saves to disk (JSONL + Markdown) regardless of the browser.
 
+## Language pairs
+
+mBabel supports three meeting profiles: **ZH↔EN**, **EN↔VI**, and **ZH↔VI**. ZH↔EN keeps the full live-draft, hotword, and speaker-separation pipeline. The two Vietnamese profiles use sentence-final multilingual recognition, without live drafts, ASR hotwords, or speaker separation; recognition corrections and the translation glossary remain active.
+
+Set the startup profile with `BABEL_PAIR=zh-en`, `BABEL_PAIR=en-vi`, or `BABEL_PAIR=zh-vi`. During a meeting, the host can switch it from the header language selector; the ASR connection restarts with a gap of about two seconds. Viewers see the current pair but cannot change it.
+
 ## Architecture
 
 ```
@@ -87,7 +93,7 @@ cd solution
 
 A browser window opens with the caption page. Useful flags:
 
-- `--share` — print a LAN link, and a public `trycloudflare.com` link if `cloudflared` is installed (`brew install cloudflared`); the page is served under a random token path.
+- `--share` — print a LAN link, and a public `trycloudflare.com` link if `cloudflared` is installed (`brew install cloudflared`); copy it from **Share/Export** in the page header. The page is served under a random token path.
 - `--translator {volc-mt,ark,qwen-mt}` — translation backend; default `volc-mt`.
 - `--end-window 600` — ms of silence that closes an ASR fragment.
 - `--port 8899` — caption UI port (default 8765), for running two instances side by side.

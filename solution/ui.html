@@ -38,7 +38,6 @@
   }
   .wordmark { font-family: var(--serif); font-size: 19px; font-weight: 700; }
   .wordmark i { font-style: italic; color: var(--accent); }
-  .session-meta { font-size: 13px; color: var(--ink-3); letter-spacing: .04em; }
   header nav { margin-left: auto; display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; row-gap: 5px; }
   header nav a, header nav select, header nav button { white-space: nowrap; }
   header nav a, header nav select, header nav button {
@@ -47,6 +46,7 @@
     font-family: var(--sans); padding: 0; appearance: none;
   }
   header nav a:hover, header nav select:hover, header nav button:hover { border-bottom-color: var(--ink-2); }
+  header nav select:disabled { opacity: .62; cursor: default; border-bottom-color: transparent; }
   header nav::-webkit-scrollbar { display: none; }
   .transport {
     display: flex; align-items: center; gap: 2px; min-height: 32px;
@@ -301,7 +301,9 @@
     min-height: 40px; border: 1px solid var(--hair); border-radius: 8px;
     background: var(--strip); color: var(--ink); font: 600 14px var(--sans); cursor: pointer;
   }
-  .review-actions #candidates-merge { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+  .review-actions #candidates-merge, .review-actions #pair-confirm {
+    background: var(--accent); color: var(--paper); border-color: var(--accent);
+  }
   .review-actions button:disabled { opacity: .55; cursor: default; }
   #candidates-error { min-height: 1.4em; color: var(--accent); font-size: 13px; }
   .lab-row { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0; }
@@ -315,9 +317,6 @@
      viewport is between ~900 and ~1040px; reserve clearance in that band too */
   @media (max-width: 1040px) {
     .live .inner { padding-right: 70px; }
-  }
-  @media (max-width: 900px) {
-    .session-meta { display: none; }
   }
   @media (max-width: 640px) {
     body { --fs-hear: 13px; --fs-draft: 15.5px; }  /* keep the whole tail readable */
@@ -354,8 +353,12 @@
 <button id="pres-exit" title="退出投屏 Exit presentation">✕ 退出投屏 Exit</button>
 <header>
   <span class="wordmark">m<i>Babel</i></span>
-  <span class="session-meta" id="session-meta">中英双语字幕</span>
   <nav>
+    <select id="pair-select" title="会议语言 Meeting languages" disabled>
+      <option value="zh-en">中↔EN</option>
+      <option value="en-vi">EN↔VI</option>
+      <option value="zh-vi">中↔VI</option>
+    </select>
     <select id="view-sel" title="选你阅读的语言 Pick your reading language">
       <option value="both">双语对照 Both</option>
       <option value="zh">中文 zh</option>
@@ -369,9 +372,8 @@
     </select>
     <a id="device-btn" title="声音设备 Audio devices" style="display:none">声音 Audio</a>
     <a id="lab-btn">实验 Lab</a>
-    <a id="share-btn" style="display:none">分享 Share</a>
     <a id="info-btn">说明 About</a>
-    <a id="export-btn">导出 Export</a>
+    <a id="share-export-btn">分享·导出 Share/Export</a>
   </nav>
   <div class="transport" aria-label="会议控制 Meeting transport">
     <span id="live-dot">LIVE</span>
@@ -415,6 +417,9 @@
     <h3>语言视图 Language view</h3>
     <p class="zh">顶栏"显示"选的是<span class="k">你阅读的语言</span>:选中文或 English 后隐藏原文行,和你语言相同的句子直接显示原文,不同的显示译文。</p>
     <p class="en">The view selector picks <span class="k">YOUR reading language</span>: originals hide, sentences in your language show as-is, the rest show their translation.</p>
+    <h3>语言对 Language pairs</h3>
+    <p class="zh">支持中↔EN、EN↔VI、中↔VI。中英模式有逐字快译、热词和说话人分离；含越南语的模式按整句出字，无热词和说话人分离。识别纠错和翻译术语表在三种模式中都照常使用。</p>
+    <p class="en">Supports ZH↔EN, EN↔VI, and ZH↔VI. ZH↔EN includes live drafts, hotwords, and speaker separation. Vietnamese pairs caption whole sentences without hotwords or speaker separation. Recognition corrections and the translation glossary remain active in all three modes.</p>
     <h3>模型 Models</h3>
     <p class="zh">识别:豆包流式语音识别 2.0(二遍识别、热词增强、说话人聚类)。翻译:火山引擎机器翻译大模型,术语表逐句注入。</p>
     <p class="en">ASR: Volcengine Seed-ASR 2.0 (two-pass, hotwords, speaker clustering). Translation: Volcengine MT LLM with per-sentence glossary.</p>
@@ -427,16 +432,21 @@
   </div>
 </div>
 
-<div class="modal-mask" id="share-mask">
+<div class="modal-mask" id="pair-mask" role="dialog" aria-modal="true">
   <div class="modal" data-lang="zh">
-    <span class="close" data-close="share-mask">✕</span>
+    <span class="close" data-close="pair-mask">✕</span>
     <button class="hbtn lang-flip">EN</button>
-    <h2>分享 Share</h2>
-    <p class="zh">打开链接的人能看到实时双语字幕,可以在自己浏览器里导出。链接在程序关闭后失效。</p>
-    <p class="en">Anyone with the link watches live bilingual captions and can export from their own browser. Links die when the app stops.</p>
-    <div id="share-links"></div>
-    <p class="zh" style="color:var(--ink-3);font-size:13px">注意:拿到公网链接的人即拿到会议字幕全文,请只发给与会者。</p>
-    <p class="en" style="color:var(--ink-3);font-size:13px">The public link exposes the full transcript. Share only with attendees.</p>
+    <h2>切换会议语言 Switch meeting languages</h2>
+    <p class="zh">切换将重启识别连接，约有 2 秒空档。</p>
+    <p class="en">Switching restarts the recognition connection, leaving a gap of about two seconds.</p>
+    <div id="pair-vi-note">
+      <p class="zh">含越南语的模式按整句出字，无热词和说话人分离；术语依赖识别纠错表与翻译术语表。</p>
+      <p class="en">Vietnamese modes caption whole sentences, without hotwords or speaker separation; terminology relies on recognition corrections and the translation glossary.</p>
+    </div>
+    <div class="review-actions">
+      <button id="pair-cancel" type="button"><span class="zh">取消</span><span class="en">Cancel</span></button>
+      <button id="pair-confirm" type="button"><span class="zh">切换</span><span class="en">Switch</span></button>
+    </div>
   </div>
 </div>
 
@@ -445,16 +455,6 @@
     <span class="close" data-close="device-mask">✕</span>
     <button class="hbtn lang-flip">EN</button>
     <h2>声音设备 Audio devices</h2>
-    <div class="device-row">
-      <label for="pair-select"><span class="zh">会议语言</span><span class="en">Meeting languages</span></label>
-      <select id="pair-select" disabled>
-        <option value="zh-en">中 ↔ English</option>
-        <option value="en-vi">English ↔ Tiếng Việt</option>
-        <option value="zh-vi">中 ↔ Tiếng Việt</option>
-      </select>
-      <p class="device-help zh">越南语模式按整句出字，无热词和说话人分离；术语依赖纠错表与翻译术语表。</p>
-      <p class="device-help en">Vietnamese modes caption whole sentences, without hotwords or speaker separation; terminology relies on corrections and the translation glossary.</p>
-    </div>
     <div class="device-row">
       <label for="mic-select"><span class="zh">麦克风</span><span class="en">Microphone</span></label>
       <select id="mic-select"></select>
@@ -506,11 +506,20 @@
   </div>
 </div>
 
-<div class="modal-mask" id="export-mask">
+<div class="modal-mask" id="share-export-mask">
   <div class="modal" data-lang="zh">
-    <span class="close" data-close="export-mask">✕</span>
+    <span class="close" data-close="share-export-mask">✕</span>
     <button class="hbtn lang-flip">EN</button>
-    <h2>导出 Export</h2>
+    <h2>分享·导出 Share / Export</h2>
+    <div id="share-section" hidden>
+      <h3>分享 Share</h3>
+      <p class="zh">打开链接的人能看到实时双语字幕，也可以在自己浏览器里导出。链接在程序关闭后失效。</p>
+      <p class="en">Anyone with the link can watch live bilingual captions and export from their own browser. Links expire when the app stops.</p>
+      <div id="share-links"></div>
+      <p class="zh" style="color:var(--ink-3);font-size:13px">拿到公网链接的人即可看到会议字幕全文，请只发给与会者。</p>
+      <p class="en" style="color:var(--ink-3);font-size:13px">The public link exposes the full transcript. Share only with attendees.</p>
+    </div>
+    <h3>导出 Export</h3>
     <label><input type="radio" name="exp-kind" value="original"> 原文 Original only</label>
     <label><input type="radio" name="exp-kind" value="translation"> 译文 Translation only</label>
     <label><input type="radio" name="exp-kind" value="bilingual" checked> 双语对照 Original + Translation</label>
@@ -647,8 +656,6 @@ function applyPair(pair) {
   if (!['zh-en', 'en-vi', 'zh-vi'].includes(pair)) return;
   sessionPair = pair;
   document.body.classList.toggle('multilingual', multilingualPair());
-  document.getElementById('session-meta').textContent = pair === 'zh-en'
-    ? '中英双语字幕' : pair.toUpperCase().replace('-', ' ↔ ');
   const oldView = viewSel.value;
   const options = multilingualPair()
     ? [['both', '原译对照 Both'], ['original', '原文 Original'], ['translation', '译文 Translation']]
@@ -1030,13 +1037,15 @@ document.getElementById('info-btn').onclick = () => openModal('info-mask');
 let shareInfo = {};
 function onShare(ev) {
   shareInfo = ev;
-  document.getElementById('share-btn').style.display = '';
+  renderShareLinks();
 }
-document.getElementById('share-btn').onclick = () => {
+function renderShareLinks() {
   const box = document.getElementById('share-links');
   box.textContent = '';
+  let hasLinks = false;
   for (const [key, label] of [['lan', '局域网 LAN'], ['public', '公网 Public']]) {
     if (!shareInfo[key]) continue;
+    hasLinks = true;
     const lab = document.createElement('div');
     lab.style.margin = '8px 0 2px'; lab.textContent = label;
     const row = document.createElement('div');
@@ -1050,8 +1059,8 @@ document.getElementById('share-btn').onclick = () => {
     row.appendChild(input); row.appendChild(btn);
     box.appendChild(lab); box.appendChild(row);
   }
-  openModal('share-mask');
-};
+  document.getElementById('share-section').hidden = !hasLinks;
+}
 
 // ---- audio devices (host only) ----
 const deviceBtn = document.getElementById('device-btn');
@@ -1116,7 +1125,25 @@ endBtn.onclick = () => {
 micSelect.onchange = sendAudioSettings;
 systemToggle.onchange = sendAudioSettings;
 speakerSelect.onchange = sendAudioSettings;
-pairSelect.onchange = () => wsSend({type: 'pair', pair: pairSelect.value});
+let pendingPair = null;
+pairSelect.onchange = () => {
+  const requested = pairSelect.value;
+  pairSelect.value = sessionPair;
+  if (!controlToken || requested === sessionPair) return;
+  pendingPair = requested;
+  document.getElementById('pair-vi-note').hidden = requested === 'zh-en';
+  openModal('pair-mask');
+};
+document.getElementById('pair-cancel').onclick = () => {
+  pendingPair = null;
+  closeModal('pair-mask');
+};
+document.getElementById('pair-confirm').onclick = () => {
+  const requested = pendingPair;
+  pendingPair = null;
+  closeModal('pair-mask');
+  if (requested && controlToken) wsSend({type: 'pair', pair: requested});
+};
 
 // ---- meeting-language review (host only) ----
 function setCandidateActionsDisabled(disabled) {
@@ -1335,7 +1362,8 @@ for (const r of document.querySelectorAll('input[name="exp-fmt"]')) {
   };
 }
 
-document.getElementById('export-btn').onclick = () => {
+document.getElementById('share-export-btn').onclick = () => {
+  renderShareLinks();
   const pool = namePool();
   refreshNameDatalist(pool);
   const ids = [...new Set(history.map(e => e.speaker).filter(s => s != null))]
@@ -1368,7 +1396,7 @@ document.getElementById('export-btn').onclick = () => {
     row.appendChild(input);
     box.appendChild(row);
   }
-  openModal('export-mask');
+  openModal('share-export-mask');
 };
 
 document.getElementById('pool-toggle').onclick = (e) => {
@@ -1434,7 +1462,7 @@ document.getElementById('export-go').onclick = () => {
   a.download = `babel-${stamp}-${kind}.${fmt}`;
   a.click();
   URL.revokeObjectURL(a.href);
-  document.getElementById('export-mask').classList.remove('open');
+  document.getElementById('share-export-mask').classList.remove('open');
 };
 </script>
 </body>

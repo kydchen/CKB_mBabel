@@ -23,6 +23,12 @@
 - **可导出**:Markdown 或带时间轴的 SRT 字幕,原文/译文/双语对照,说话人名字浏览器本地记忆。
 - **长会稳健性**:ASR 断线自动退避重连,限流单独分类退避、失败句静默补译,语种误识句带「识别存疑」标记,全场转录自动落盘(JSONL + Markdown),不依赖浏览器。
 
+## 语言对
+
+mBabel 支持三种会议配置:**中↔EN**、**EN↔VI** 和 **中↔VI**。中英模式保留逐字快译、ASR 热词和说话人分离的完整链路。两种越南语模式改用整句落定的多语识别，无逐字快译、ASR 热词和说话人分离；识别纠错和翻译术语表仍然生效。
+
+启动时可设 `BABEL_PAIR=zh-en`、`BABEL_PAIR=en-vi` 或 `BABEL_PAIR=zh-vi`。会中主持人可在顶栏语言对下拉框切换，识别连接会重启并留下约两秒空档；观众能看到当前语言对，但不能修改。
+
 ## 架构
 
 ```
@@ -87,7 +93,7 @@ cd solution
 
 浏览器自动打开字幕页。常用参数:
 
-- `--share`:打印局域网链接;装了 cloudflared(`brew install cloudflared`)自动打印公网链接,页面右上角"分享 Share"按钮可直接复制;页面挂在随机 token 路径下。
+- `--share`:打印局域网链接;装了 cloudflared(`brew install cloudflared`)自动打印公网链接,可在顶栏“分享·导出 Share/Export”里复制;页面挂在随机 token 路径下。
 - `--translator {volc-mt,ark,qwen-mt}`:翻译后端,默认 volc-mt。
 - `--end-window 600`:判停静音毫秒数。
 - `--port 8899`:字幕页端口(默认 8765),可双实例并行。
