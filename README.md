@@ -25,7 +25,7 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 
 ## Language pairs
 
-mBabel supports three meeting profiles: **ZH↔EN**, **EN↔VI**, and **ZH↔VI**. ZH↔EN keeps the full live-draft, hotword, and speaker-separation pipeline. The two Vietnamese profiles use sentence-final multilingual recognition, without live drafts, ASR hotwords, or speaker separation; recognition corrections and the translation glossary remain active.
+mBabel supports three meeting profiles: **ZH↔EN**, **EN↔VI**, and **ZH↔VI**. ZH↔EN keeps the full live-draft, hotword, and speaker-separation pipeline. The two Vietnamese profiles use sentence-final multilingual recognition, without live drafts, ASR hotwords, or speaker separation; recognition corrections and the translation glossary remain active. Sentences commit at natural pauses (400 ms VAD window in these modes), and while someone is speaking a local volume indicator in the bottom strip shows the app is hearing the room.
 
 Set the startup profile with `BABEL_PAIR=zh-en`, `BABEL_PAIR=en-vi`, or `BABEL_PAIR=zh-vi`. During a meeting, the host can switch it from the header language selector; the ASR connection restarts with a gap of about two seconds. Viewers see the current pair but cannot change it.
 
@@ -95,7 +95,7 @@ A browser window opens with the caption page. Useful flags:
 
 - `--share` — print a LAN link, and a public `trycloudflare.com` link if `cloudflared` is installed (`brew install cloudflared`); copy it from **Share/Export** in the page header. The page is served under a random token path.
 - `--translator {volc-mt,ark,qwen-mt}` — translation backend; default `volc-mt`.
-- `--end-window 600` — ms of silence that closes an ASR fragment.
+- `--end-window 600` — ms of silence that closes an ASR fragment (default: 800 for ZH↔EN, 400 for Vietnamese pairs).
 - `--port 8899` — caption UI port (default 8765), for running two instances side by side.
 - `--wav test.wav` — replay a 16kHz mono WAV instead of the mic (a sample is included).
 - `--no-ui` — terminal-only output.
