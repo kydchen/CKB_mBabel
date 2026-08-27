@@ -14,9 +14,15 @@ import main as babel
 from translate import translation_rejection_reason
 
 
-def request_payload(pair):
-    packet = asr_client._build_full_request(asr_client.AsrConfig(pair=pair))
+def config_payload(config):
+    packet = asr_client._build_full_request(config)
     return json.loads(gzip.decompress(packet[8:]))
+
+
+def request_payload(pair, end_window_size=None):
+    return config_payload(asr_client.AsrConfig(
+        pair=pair, end_window_size=end_window_size
+    ))
 
 
 zh_packet = asr_client._build_full_request(asr_client.AsrConfig(pair="zh-en"))
@@ -45,7 +51,7 @@ assert zh_corpus["request"]["corpus"] == {
 vi_expected = {
     "model_name": "bigmodel", "enable_punc": True,
     "enable_speaker_info": True, "enable_auto_lang": True,
-    "end_window_size": 800, "show_utterances": True,
+    "end_window_size": 400, "show_utterances": True,
     "result_type": "single",
 }
 for pair in ("en-vi", "zh-vi"):
@@ -56,6 +62,15 @@ for pair in ("en-vi", "zh-vi"):
     assert payload["request"] == vi_expected
     assert "corpus" not in payload["request"]
 assert request_payload("en-vi") == request_payload("zh-vi")
+assert request_payload("zh-en", 600)["request"]["end_window_size"] == 600
+assert request_payload("en-vi", 600)["request"]["end_window_size"] == 600
+
+switching = asr_client.AsrConfig(pair="zh-en")
+assert config_payload(switching)["request"]["end_window_size"] == 800
+switching.set_pair("en-vi")
+assert config_payload(switching)["request"]["end_window_size"] == 400
+switching.set_pair("zh-en")
+assert config_payload(switching)["request"]["end_window_size"] == 800
 
 
 def pcm(sample):
@@ -151,9 +166,11 @@ class SentenceAsr:
         self.close_calls += 1
 
     async def transcribe(self, chunks):
+        assert self.config.pair == "zh-en"
+        assert config_payload(self.config)["request"] == zh["request"]
         await UI.instance.on_control({"type": "pair", "pair": "en-vi"})
         assert self.config.endpoint == asr_client.MULTILINGUAL_ENDPOINT
-        assert request_payload(self.config.pair)["request"] == vi_expected
+        assert config_payload(self.config)["request"] == vi_expected
         assert await anext(chunks)
         yield SimpleNamespace(
             text="",
@@ -197,7 +214,7 @@ async def pipeline_check(root):
         wav=os.path.join(os.path.dirname(__file__), "test.wav"),
         audio_config=os.path.join(root, "audio.json"), glossary=glossary,
         hotwords_dir=hotwords, translator="volc-mt", model=None,
-        no_ui=False, share=False, port=8765, end_window=800, pair="zh-en",
+        no_ui=False, share=False, port=8765, end_window=None, pair="zh-en",
     )
     UI.events.clear(); UI.broadcasts.clear()
     FastTranslator.calls.clear(); RefinedTranslator.calls.clear()
@@ -237,4 +254,4 @@ os.environ["VOLC_ASR_API_KEY"] = "offline-test"
 with tempfile.TemporaryDirectory(prefix="mbabel-d9-") as root:
     asyncio.run(pipeline_check(root))
 
-print("D9/D11: payloads, routing, VI gate, switch, liveness, and sentence pipeline pass")
+print("D9/D11/D13: payloads, routing, VI gate, switch, liveness, and sentence pipeline pass")

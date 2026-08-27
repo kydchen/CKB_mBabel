@@ -71,7 +71,7 @@ class AsrConfig:
     enable_speaker_info: bool = True  # speaker clustering, needs nonstream + ssd 200
     ssd_version: str = "200"
     enable_lid: bool = True  # per-segment language labels (speech_en/speech_mand…)
-    end_window_size: int = 800  # ms of silence that closes a segment
+    end_window_size: int | None = None  # explicit override; defaults follow pair
     enable_ddc: bool = False  # disfluency smoothing
     uid: str = "babel"
 
@@ -83,6 +83,12 @@ class AsrConfig:
             raise ValueError(f"unsupported language pair: {pair}")
         self.pair = pair
         self.endpoint = ENDPOINT if pair == "zh-en" else MULTILINGUAL_ENDPOINT
+
+    @property
+    def effective_end_window_size(self) -> int:
+        if self.end_window_size is not None:
+            return self.end_window_size
+        return 800 if self.pair == "zh-en" else 400
 
 
 @dataclass
@@ -113,7 +119,7 @@ def _build_full_request(config: AsrConfig) -> bytes:
             "enable_speaker_info": config.enable_speaker_info,
             "ssd_version": config.ssd_version,
             "enable_lid": config.enable_lid,
-            "end_window_size": config.end_window_size,
+            "end_window_size": config.effective_end_window_size,
             "show_utterances": True,
             "result_type": "single",
             "enable_ddc": config.enable_ddc,
@@ -132,7 +138,7 @@ def _build_full_request(config: AsrConfig) -> bytes:
             "enable_punc": True,
             "enable_speaker_info": True,
             "enable_auto_lang": True,
-            "end_window_size": config.end_window_size,
+            "end_window_size": config.effective_end_window_size,
             "show_utterances": True,
             "result_type": "single",
         }

@@ -2559,9 +2559,9 @@ def main() -> None:
                         help="volc-mt: speech-product MT, same key as ASR (default); "
                              "ark: Doubao LLM on Ark; qwen-mt: Alibaba")
     parser.add_argument("--model", help="override the translation model id")
-    parser.add_argument("--end-window", type=int, default=800,
+    parser.add_argument("--end-window", type=int,
                         help="ms of silence that closes an ASR fragment; sentences are "
-                             "reassembled by the accumulator, so keep this moderate")
+                             "reassembled by the accumulator (default: zh-en 800, vi 400)")
     parser.add_argument("--env", default=os.path.join(os.path.dirname(__file__), "..", ".env"),
                         help="path to the .env file with API credentials")
     parser.add_argument("--hotwords-dir", default=os.path.join(os.path.dirname(__file__), "..", "hotwords"),
