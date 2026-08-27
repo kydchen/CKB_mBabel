@@ -643,24 +643,37 @@ const draftFreshEl = document.getElementById('draft-fresh');
 let draftShown = '';
 let draftStable = '';  // frozen prefix: never rewritten within one sentence
 const DRAFT_TAIL_CAP = 64;  // the moving gray tail stays around half a line
-const VU_ACTIVE_THRESHOLD = .015;  // RMS; tune here if a microphone's noise floor differs
+const VU_ABS_MIN = .0015;  // reject digital silence before relative calibration
+const VU_FLOOR_MULTIPLIER = 3;  // speech must clear the recent noise floor by this ratio
+const vuLevels = [];
+let vuPeak = 0;
 let vuIdleTimer = null;
-function resetVu() {
+function idleVu() {
   clearTimeout(vuIdleTimer);
   vuIdleTimer = null;
   document.body.classList.remove('vu-active');
   vuText.textContent = '等待声音 listening…';
   vuBars.style.removeProperty('--vu-height');
 }
+function resetVu() {
+  idleVu();
+  vuLevels.length = 0;
+  vuPeak = 0;
+}
 function onVu(rawLevel) {
   if (!multilingualPair()) return;
   const level = Math.max(0, Math.min(1, Number(rawLevel) || 0));
-  if (level <= VU_ACTIVE_THRESHOLD) return;
+  vuLevels.push(level);
+  if (vuLevels.length > 150) vuLevels.shift();  // about 30s at the 5Hz event rate
+  const floor = Math.min(...vuLevels);
+  vuPeak = Math.max(level, vuPeak * .98);
+  const relative = level / Math.max(vuPeak, floor * 4, .003);
+  vuBars.style.setProperty('--vu-height', `${Math.round(4 + 8 * Math.min(1, relative))}px`);
+  if (level <= Math.max(VU_ABS_MIN, floor * VU_FLOOR_MULTIPLIER)) return;
   document.body.classList.add('vu-active');
   vuText.textContent = '正在聆听，整句识别中 hearing you, transcribing…';
-  vuBars.style.setProperty('--vu-height', `${Math.round(4 + Math.min(1, level * 8) * 8)}px`);
   clearTimeout(vuIdleTimer);
-  vuIdleTimer = setTimeout(resetVu, 1500);
+  vuIdleTimer = setTimeout(idleVu, 1500);
 }
 function clearDraft() {
   draftShown = '';
