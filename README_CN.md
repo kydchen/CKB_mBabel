@@ -17,7 +17,7 @@
 - **说话人标签**:服务端说话人聚类,说话人名字排在页边,导出时命名会实时更新到页面。
 - **免训练的领域适配**:ASR 热词(直传加自学习词表双通道)、客户端纠错词表、逐句强制的翻译术语表。
 - **会中即时纠错(仅主持人)**:实验面板输入 `错词=正确词`,后续句子即时生效,退出时写回术语表,下次开会自动带着。
-- **会议式设备控制(仅主持人)**:在网页里选择或热切换麦克风和听音设备,可选混入 BlackHole 系统声音;线上会议的多输出路由由 mBabel 自动建立,退出时还原原系统输出。
+- **会议式设备控制(仅主持人)**:在网页里选择或热切换音频设备。macOS 可混入 BlackHole 系统声音;Windows 则直接选择系统提供的采集设备,部分环境可用“主声音捕获驱动程序”。所选麦克风消失时会自动回退。
 - **观众端偏好**:每个浏览器自选语言视图(双语/只看中文/只看英文)、四档字号含投屏模式;字幕只在贴底时自动跟随,上翻回看不被打断,一键"回到最新"。
 - **可分享,观众只读**:局域网链接开箱即用;装了 cloudflared 一键出公网链接(无需账号)。管控操作需要主持人令牌,局域网和公网观众都拿不到。
 - **可导出**:Markdown 或带时间轴的 SRT 字幕,原文/译文/双语对照,说话人名字浏览器本地记忆。
@@ -32,7 +32,7 @@ mBabel 支持三种会议配置:**中↔EN**、**EN↔VI** 和 **中↔VI**。�
 ## 架构
 
 ```
-麦克风/系统声音(macOS: BlackHole + 软件混音)
+所选音频输入(macOS: 麦克风 + 可选 BlackHole)
   → 火山 Seed-ASR 2.0(流式、二遍识别、热词、说话人聚类)
   → 句子累积器(语言边界切分、静音看门狗)
   → 快速草稿:火山机器翻译(matx_translate,原生术语表)
@@ -74,21 +74,45 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # PyPI 慢加镜像 -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
+Windows 建议在 PowerShell 使用 Python 3.12:
+
+```powershell
+cd solution
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
 macOS 可选安装:双击一次 `install-app.command`,会按当前克隆路径在
 `/Applications`(无权限时 `~/Applications`)生成本机专属 `mBabel.app`,
 并自动带上 mBabel 图标(来自 `assets/icon.png`,只用 macOS 自带工具生成)。
 
-### 3. 音频路由(macOS)
+### 3. 音频采集
+
+#### macOS
 
 - 线下会议:无需配置,直接用 MacBook 麦克风。
 - 线上会议(Zoom/Teams/Meet):`brew install blackhole-2ch`,然后在 mBabel 声音面板选择听音设备并打开“采集会议声音”。
 - 会议软件的扬声器保持**系统默认**。mBabel 会自动创建或复用自己的多输出路由,关闭采集或退出时还原原系统输出,无需再进“音频 MIDI 设置”。
+
+#### Windows
+
+- 建议使用 Python 3.12。Python 3.14 与部分依赖及系统接口存在兼容性问题,暂不建议使用。
+- Windows 不需要安装 BlackHole。运行 `python main.py --list-devices` 可查看当前硬件和驱动提供的音频设备。
+- 在线会议时,部分 Windows 环境会提供“主声音捕获驱动程序”。连接耳麦后,可在 mBabel 声音面板的麦克风下拉框中选择它来采集会议播放声音。设备是否存在及其能力取决于具体硬件和驱动,不能假设所有电脑都有。
 
 ### 4. 运行
 
 ```bash
 cd solution
 .venv/bin/python main.py
+```
+
+Windows 请先在 PowerShell 激活 `.venv`,再运行:
+
+```powershell
+cd solution
+python main.py --env .env
 ```
 
 浏览器自动打开字幕页。常用参数:
@@ -116,7 +140,7 @@ cd solution
 - 音频经云端处理,有全离线需求的场合这套方案不适用。
 - 主持人专属的暂停按钮会主动断开 ASR 并丢弃暂停期间的音频;继续时走已有重连路径。
 - 转录自动保存在 `solution/transcripts/`(运行时创建,不入库)。
-- 在 macOS(Apple Silicon)上实测;音频采集层理论跨平台,路由说明是 macOS 专属。
+- macOS(Apple Silicon)已实测。Windows 音频采集取决于机器的音频硬件和驱动所暴露的设备及能力,详见上面的 Windows 说明。
 
 ## License
 

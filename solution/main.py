@@ -151,6 +151,19 @@ def register_session(port: int, url: str) -> str:
     os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
     path = session_file_path(port)
     temp_path = f"{path}.{os.getpid()}.tmp"
+    if sys.platform == "win32":
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "port": port,
+                "url": url,
+                "started_at": time.time(),
+            }, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        return path
+
     fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.fchmod(fd, 0o600)
@@ -1653,7 +1666,7 @@ async def run(args) -> None:
     ark_polisher = None
     try:
         ark_polisher = ArkTranslator(
-            glossary, model=os.environ.get("ARK_MODEL", "doubao-seed-2-0-mini-260215")
+            glossary, model=os.environ.get("ARK_MODEL", "doubao-seed-2-0-mini-260428")
         )
     except Exception:
         print("[translate] ark backend unavailable; refined falls back to volc-mt")
@@ -2268,8 +2281,11 @@ async def run(args) -> None:
         discard_queued_audio(queue)
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        loop.add_signal_handler(sig, request_shutdown, "signal")
+    if sys.platform == "win32":
+        signal.signal(signal.SIGINT, lambda *_: request_shutdown("signal"))
+    else:
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            loop.add_signal_handler(sig, request_shutdown, "signal")
     try:
         while True:  # ASR reconnect loop: survive network blips mid-meeting
             await wait_while_paused()

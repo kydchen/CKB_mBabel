@@ -423,7 +423,7 @@ def build_translator(backend: str, glossary: Glossary, model: str | None = None)
     if backend == "ark":
         return ArkTranslator(
             glossary,
-            model=model or os.environ.get("ARK_MODEL", "doubao-seed-2-0-mini-260215"),
+            model=model or os.environ.get("ARK_MODEL", "doubao-seed-2-0-mini-260428"),
         )
     if backend == "qwen-mt":
         return QwenMtTranslator(glossary, model=model or "qwen-mt-plus")

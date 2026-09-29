@@ -20,9 +20,23 @@
 3. 安装:`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`(PyPI 慢加清华镜像 `-i https://pypi.tuna.tsinghua.edu.cn/simple`)。
 4. 可选:双击 `../install-app.command`,在 Applications 生成绑定当前克隆路径的 `mBabel.app`。
 
+Windows 建议使用 Python 3.12;Python 3.14 与部分依赖及系统接口存在兼容性问题,暂不建议使用。在 `solution` 目录的 PowerShell 中执行:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
 ## 日常使用
 
+### macOS 音频
+
 线上会议只需一次性安装 BlackHole 2ch。会议软件的扬声器保持“系统默认”;在 mBabel 声音面板选择听音设备并打开“采集会议声音”。mBabel 会自动创建多输出路由,把声音同时送到所选设备和 BlackHole,关闭采集或退出时还原原系统输出;无需再进“音频 MIDI 设置”。
+
+### Windows 音频
+
+Windows 不需要 BlackHole。运行 `python main.py --list-devices` 查看当前硬件和驱动提供的设备。部分系统会在 mBabel 的麦克风下拉框中提供 **Primary Sound Capture Driver**（“主声音捕获驱动程序”）；连接耳麦后选择它可采集会议播放声音。设备和能力取决于具体电脑及驱动,并非所有 Windows 机器都提供。
 
 每次开会双击 `mBabel.app` 或 `../Babel.command`,也可手动:
 
@@ -31,6 +45,8 @@ cd CKBA/Babel/solution
 .venv/bin/python main.py
 .venv/bin/python main.py --share           # 打印 LAN 链接;装了 cloudflared 自动出公网链接
 ```
+
+Windows 请在 PowerShell 激活虚拟环境后,从 `solution` 目录运行 `python main.py --env .env`。
 
 启动后浏览器自动打开字幕页。本机主持人顶栏会看到麦克风芯片和暂停按钮:可选麦克风、会中热切换,并打开“采集会议声音”让 BlackHole 进入混音;暂停会主动断开 ASR 并丢弃期间音频,继续后走重连路径。设置保存在 `~/.mbabel/audio_config.json`。当前麦克风消失时,3 秒内出现红色警告并自动回落系统默认麦,ASR 会话不断。没装 BlackHole 时线下麦克风照常可用,开关置灰并显示安装命令。
 
