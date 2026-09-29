@@ -17,7 +17,7 @@ No audio is stored locally; audio is processed by Volcengine cloud APIs.
 - **Speaker labels**: server-side speaker clustering; names sit in the script margin, and the names you assign at export time update the page live.
 - **Domain adaptation without training**: ASR hotwords (direct + boosting table), a client-side corrections map for systematic mishearings, and a translation glossary enforced per sentence.
 - **Live corrections (host only)**: fix a recurring mishearing mid-meeting from the Lab panel (`错词=正确词`); applies to all following sentences instantly and persists to the glossary on exit.
-- **Meeting-style device controls (host only)**: pick or hot-switch the microphone and listening output in the browser, optionally mix in BlackHole system audio, and automatically fall back if a selected device disappears. mBabel builds the Multi-Output route for online meetings and restores the previous system output on exit.
+- **Meeting-style device controls (host only)**: pick or hot-switch audio devices in the browser. macOS can mix BlackHole system audio; on Windows, available capture devices are selected directly, including the system-provided **Primary Sound Capture Driver** on some setups. Devices automatically fall back if a selected microphone disappears.
 - **Viewer preferences**: per-browser language view (bilingual / Chinese only / English only), four font sizes including a full-screen presentation mode; captions auto-follow only while you are at the bottom, with a "back to latest" button after scrolling up.
 - **Shareable, read-only for viewers**: LAN link out of the box; a public `trycloudflare.com` link is one flag away (no account needed). Pipeline controls require a host token that is never sent to LAN or tunneled viewers.
 - **Export**: Markdown or timestamped SRT — original, translation, or bilingual — with speaker names you type once and the browser remembers.
@@ -32,7 +32,7 @@ Set the startup profile with `BABEL_PAIR=zh-en`, `BABEL_PAIR=en-vi`, or `BABEL_P
 ## Architecture
 
 ```
-selected mic + optional BlackHole → 200ms software mixer (mono s16le)
+selected audio input (macOS: mic + optional BlackHole) → 200ms software mixer (mono s16le)
   → Volcengine Seed-ASR 2.0 (streaming, two-pass, hotwords, speaker info)
   → sentence accumulator (language-boundary split, silence watchdog)
   → live draft: Volcengine MT (matx_translate, native glossary_list)
@@ -74,21 +74,44 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # use a mirror if PyPI is slow
 ```
 
+On Windows, use Python 3.12 in PowerShell:
+
+```powershell
+cd solution
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
 Optional macOS app: double-click `install-app.command` once. It builds a local
 `mBabel.app` for this clone in `/Applications` (or `~/Applications`), with the
 mBabel icon applied automatically (from `assets/icon.png`, stock macOS tools only).
 
-### 3. Audio routing (macOS)
+### 3. Audio routing
+
+#### macOS
 
 - In-person meetings: nothing to do, the MacBook mic works.
 - Online meetings (Zoom/Teams/Meet): install BlackHole (`brew install blackhole-2ch`). In mBabel's audio panel, choose your listening output and enable **Capture meeting audio**.
 - Keep the meeting app's speaker output on **System Default**. mBabel creates or reuses its own Multi-Output route while capture is enabled and restores the previous system output when capture is disabled or the app exits. No Audio MIDI Setup is required.
 
+#### Windows
+
+- Python 3.12 is recommended. Python 3.14 is not recommended because some dependencies and system interfaces are not yet compatible.
+- Windows does not need BlackHole. List the audio devices exposed by the current hardware and drivers with `python main.py --list-devices`.
+- For online meetings, some Windows systems expose **Primary Sound Capture Driver** (shown in Chinese as “主声音捕获驱动程序”). With a headset connected, select it from the microphone dropdown in mBabel's audio panel to capture meeting playback. Availability and behavior depend on the audio hardware and driver; this device is not present on every Windows machine.
 ### 4. Run
 
 ```bash
 cd solution
 .venv/bin/python main.py
+```
+
+On Windows, activate the `.venv` in PowerShell first, then run:
+
+```powershell
+cd solution
+python main.py --env .env
 ```
 
 A browser window opens with the caption page. Useful flags:
@@ -127,7 +150,7 @@ Transcripts land in `solution/transcripts/` (created at runtime, gitignored).
 - Speaker labels are cluster ids (说话人 1/2/…), stable within a session, not named identities.
 - Cloud processing means meeting audio leaves the machine; for fully offline needs this stack is not the answer.
 - The host-only Pause control closes ASR and discards audio until Resume; recovery uses the normal reconnect path.
-- Tested on macOS (Apple Silicon). The audio-capture layer is cross-platform in principle; the routing instructions are macOS-specific.
+- Tested on macOS (Apple Silicon). Windows audio capture depends on the devices and capabilities exposed by the machine's audio hardware and drivers; see the Windows audio notes above.
 
 ## License
 

@@ -23,7 +23,7 @@ Pipeline: mic/system audio → Volcengine Seed-ASR (streaming, hotwords) → Vol
 VOLC_ASR_API_KEY=...   # the only required key: streaming ASR + translation
 # optional fallback backend:
 ARK_API_KEY=...
-ARK_MODEL=doubao-seed-2-0-lite-260215
+ARK_MODEL=doubao-seed-2-0-lite-260428
 ```
 
 Verified end-to-end on 2026-08-08. Translation is three-stage since W1: volc-mt drafts (whole QPM budget, 0.6s debounce) -> a draft covering at least 60% of the final source is promoted as the provisional caption at commit (italic ≈) -> an ark refined pass with the previous four source/translation pairs as context replaces it in place (falls back to volc-mt without ark credentials).
@@ -31,6 +31,14 @@ Verified end-to-end on 2026-08-08. Translation is three-stage since W1: volc-mt 
 3. Install (use a venv):
 
 ```bash
+pip install -r requirements.txt
+```
+
+On Windows, use Python 3.12 in PowerShell from the `solution` directory. Python 3.14 is not recommended because some dependencies and system interfaces are not yet compatible:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -48,10 +56,16 @@ Credentials (`../.env`), `glossary.json`, and `../hotwords/*.txt` all load autom
 
 ## Daily meeting usage
 
+### macOS audio
+
 One-time audio setup for online meetings (Zoom / Teams / Google Meet / 腾讯会议):
 
 1. Install BlackHole 2ch (`brew install blackhole-2ch`).
 2. Keep the meeting app's speaker output on **System Default**. In mBabel's audio panel, choose your listening output and enable **Capture meeting audio**. mBabel creates the Multi-Output route and restores the previous system output on exit.
+
+### Windows audio
+
+BlackHole is not needed. Run `python main.py --list-devices` to inspect the devices provided by the current hardware and drivers. On some systems, **Primary Sound Capture Driver** (主声音捕获驱动程序) is available in mBabel's microphone dropdown; with a headset connected, select it to capture meeting playback. The device and its capabilities vary by machine and driver.
 
 For every meeting:
 
