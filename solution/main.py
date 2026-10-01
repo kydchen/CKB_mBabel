@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import difflib
 import hashlib
 import http.client
@@ -22,16 +23,18 @@ import shutil
 import signal
 import sys
 import time
+import traceback
 import unicodedata
 import wave
 import webbrowser
 from collections import Counter, deque
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from urllib.parse import urlsplit
 
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from asr_client import AsrConfig, AsrError, VolcAsrClient
-from translate import (ArkTranslator, Glossary, build_translator,
+from translate import (ARK_TIMEOUT_SECONDS, ArkTranslator, Glossary, build_translator,
                        translation_rejection_reason)
 from ui_server import CaptionUI
 
@@ -94,6 +97,126 @@ REPLAY_GUARD_FRAGMENTS = 5
 CLAUSE_FLUSH_CHARS = 80
 CLAUSE_ENDINGS = ("，", "、", "；", ",", ";")
 SESSION_DIR = os.path.join(os.path.expanduser("~"), ".mbabel")
+SHUTDOWN_TRANSLATION_SECONDS = 30.0
+
+
+class LogTee:
+    """Keep a per-session log even after a terminal's pty disappears."""
+
+    def __init__(self, stream, log):
+        self.stream, self.log = stream, log
+        self.log_failed = False
+
+    def write(self, text):
+        if not self.log_failed:
+            try:
+                self.log.write(text)
+                self.log.flush()
+            except OSError as error:
+                # A logging failure must not kill audio or abandon the PIPE.
+                self.log_failed = True
+                try:
+                    self.stream.write(f"[log] disk logging disabled: {error}\n")
+                except OSError:
+                    pass
+        try:
+            self.stream.write(text)
+        except OSError:
+            pass
+        return len(text)
+
+    def flush(self):
+        if not self.log_failed:
+            try:
+                self.log.flush()
+            except OSError:
+                self.log_failed = True
+        try:
+            self.stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+@contextmanager
+def session_log(path: str):
+    # Logs contain local control tokens; never make them world-readable.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    if sys.platform != "win32":
+        os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as log, \
+         redirect_stdout(LogTee(sys.stdout, log)), \
+         redirect_stderr(LogTee(sys.stderr, log)):
+        yield log
+
+
+def trim_stats(counters: dict, latencies: deque, now: float) -> None:
+    for values in counters.values():
+        while values and values[0] <= now - 60:
+            values.popleft()
+    while latencies and latencies[0][0] <= now - 60:
+        latencies.popleft()
+
+
+def correction_trace(raw: str, pattern, mapping: dict) -> dict:
+    """Keep exact raw offsets while replacements change the displayed length."""
+    pieces, bounds, hits = [], [0], []
+    cursor = fixed_end = 0
+    for match in pattern.finditer(raw) if pattern else ():
+        plain = raw[cursor:match.start()]
+        pieces.append(plain)
+        bounds.extend(range(cursor + 1, match.start() + 1))
+        fixed_end += len(plain)
+        replacement = mapping[match.group().lower()]
+        pieces.append(replacement)
+        if replacement:
+            bounds.extend([match.start()] * (len(replacement) - 1) + [match.end()])
+        else:
+            bounds[-1] = match.end()
+        if replacement != match.group():
+            hits.append((fixed_end, fixed_end + len(replacement), match.group().lower()))
+        fixed_end += len(replacement)
+        cursor = match.end()
+    pieces.append(raw[cursor:])
+    bounds.extend(range(cursor + 1, len(raw) + 1))
+    return {"text": "".join(pieces), "raw": raw, "bounds": bounds, "hits": hits}
+
+
+def slice_trace(trace: dict, start: int, end: int) -> dict:
+    a, b = trace["bounds"][start], trace["bounds"][end]
+    return {"text": trace["text"][start:end], "raw": trace["raw"][a:b],
+            "bounds": [v - a for v in trace["bounds"][start:end + 1]],
+            "hits": [(max(x, start) - start, min(y, end) - start, key)
+                     for x, y, key in trace["hits"] if x < end and y > start]}
+
+
+def join_traces(traces: list[dict]) -> dict:
+    result = {"text": "", "raw": "", "bounds": [0], "hits": []}
+    for trace in traces:
+        fixed_offset, raw_offset = len(result["text"]), len(result["raw"])
+        result["text"] += trace["text"]
+        result["raw"] += trace["raw"]
+        result["bounds"].extend(raw_offset + v for v in trace["bounds"][1:])
+        result["hits"].extend((a + fixed_offset, b + fixed_offset, key)
+                              for a, b, key in trace["hits"])
+    return result
+
+
+def merge_traces(prefix: dict, suffix: dict) -> dict:
+    # Reuse U5's exact overlap decision; raw evidence follows the same cut.
+    def stripped(trace):
+        start = len(trace["text"]) - len(trace["text"].lstrip())
+        return slice_trace(trace, start, max(start, len(trace["text"].rstrip())))
+
+    prefix, suffix = stripped(prefix), stripped(suffix)
+    merged = merge_reconnect_partial(prefix["text"], suffix["text"])
+    tail_length = len(merged) - len(prefix["text"])
+    separator = " " if tail_length > len(suffix["text"]) else ""
+    tail_length -= len(separator)
+    tail = slice_trace(suffix, len(suffix["text"]) - tail_length, len(suffix["text"]))
+    return join_traces([prefix, correction_trace(separator, None, {}), tail])
 
 
 def session_file_path(port: int) -> str:
@@ -1417,30 +1540,109 @@ async def maybe_tunnel(port: int):
             exe, "tunnel", "--url", f"http://127.0.0.1:{port}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
-        try:
-            assert proc.stdout is not None
-            for _ in range(60):
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
-                if not line:
-                    break
-                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com",
-                              line.decode(errors="ignore"))
-                if m:
-                    return proc, m.group(0)
-        except asyncio.CancelledError:
-            proc.terminate()  # Ctrl-C during tunnel setup: no orphan
-            raise
-        except Exception:
-            pass
-        proc.terminate()  # no URL found in time: never leave an orphan tunnel
-    except Exception:
+    except OSError as error:
+        print(f"[tunnel] cannot start: {error}", file=sys.stderr)
         return None, None
+
+    found = asyncio.get_running_loop().create_future()
+
+    async def read_output():
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        scanned = ""
+        try:
+            while data := await proc.stdout.read(4096):
+                text = decoder.decode(data)
+                for piece in text.splitlines():
+                    print(f"[tunnel] {piece}", file=sys.stderr)
+                if not found.done():
+                    scanned = (scanned + text)[-8192:]
+                    match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", scanned)
+                    if match:
+                        found.set_result(match.group())
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                print(f"[tunnel] {tail}", file=sys.stderr)
+        finally:
+            if not found.done():
+                found.set_result(None)
+
+    # The reader owns the PIPE for the process's whole lifetime, not just setup.
+    proc._babel_reader = asyncio.create_task(read_output())
+    try:
+        public_url = await asyncio.wait_for(found, 30)
+        if public_url:
+            return proc, public_url
+    except asyncio.CancelledError:
+        await stop_tunnel(proc)
+        raise
+    except asyncio.TimeoutError:
+        print("[tunnel] URL setup timed out", file=sys.stderr)
+    await stop_tunnel(proc)
     return None, None
+
+
+async def stop_tunnel(proc) -> None:
+    if proc.returncode is None:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), 3)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+    reader = getattr(proc, "_babel_reader", None)
+    if reader:
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+async def maintain_tunnel(port: int, ui, lan_url: str, suffix: str) -> None:
+    for attempt in range(2):  # One automatic restart per meeting, never a loop.
+        proc = None
+        try:
+            proc, public_url = await maybe_tunnel(port)
+            if public_url:
+                public_url += suffix
+                print(f"[share] public link: {public_url}  (cloudflared quick tunnel)")
+                await ui.set_share(lan_url, public_url)
+                code = await proc.wait()
+                notice = f"Public tunnel exited ({code})"
+            else:
+                notice = "Public tunnel unavailable (cloudflared missing or timed out)"
+            await ui.set_share(lan_url, None)
+            notice += "; restarting once…" if attempt == 0 else "; LAN only"
+            print(f"[share] {notice}", file=sys.stderr)
+            # Host-only: the shared status channel drives the LIVE pill, which
+            # must reflect ASR health, not tunnel churn (captions keep flowing).
+            await ui.emit_control({"type": "tunnel_state", "text": notice})
+        finally:
+            if proc:
+                await stop_tunnel(proc)
 
 
 async def run(args) -> None:
     if not args.no_ui and reopen_existing_session(args.port):
         return
+
+    transcript_dir = os.path.join(os.path.dirname(__file__), "transcripts")
+    os.makedirs(transcript_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M")
+    with session_log(os.path.join(transcript_dir, f"babel-{stamp}.log")) as log:
+        try:
+            await _run(args, stamp)
+        except SystemExit as error:
+            print_safe(str(error), file=log)  # The CLI prints it once on exit.
+            raise
+        except Exception:
+            try:
+                traceback.print_exc(file=log)
+            except OSError:
+                pass
+            raise
+
+
+async def _run(args, stamp: str) -> None:
 
     session_pair = {"value": normalize_pair(getattr(args, "pair", None))}
 
@@ -1535,10 +1737,10 @@ async def run(args) -> None:
     # CKC -> CKCon) client-side before display and translation. Rebuildable
     # at runtime: the UI can push new corrections mid-meeting.
     corr_map = {k.lower(): v for k, v in glossary.corrections.items()}
+    corr_keys = {k.lower(): k for k in glossary.corrections}
     new_corrections: dict = {}  # pushed via UI this session, persisted on exit
     transcript_dir = os.path.join(os.path.dirname(__file__), "transcripts")
     os.makedirs(transcript_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M")
     jsonl_path = os.path.join(transcript_dir, f"babel-{stamp}.jsonl")
     pending_path, pending_payload = (
         latest_candidates(transcript_dir) if not args.no_ui else (None, None)
@@ -1566,10 +1768,10 @@ async def run(args) -> None:
 
     corr = {"re": build_corr_re()}
 
-    def correct(text: str) -> str:
-        if not corr["re"]:
-            return text
-        return corr["re"].sub(lambda m: corr_map[m.group(0).lower()], text)
+    def traced(text: str) -> dict:
+        trace = correction_trace(text, corr["re"], corr_map)
+        trace["hits"] = [(a, b, corr_keys[key]) for a, b, key in trace["hits"]]
+        return trace
 
     if args.translator == "volc-mt" and not os.environ.get("VOLC_ASR_API_KEY"):
         sys.exit(
@@ -1583,7 +1785,6 @@ async def run(args) -> None:
     }
 
     ui: CaptionUI | None = None
-    tunnel_proc = None
     share_task: asyncio.Task | None = None
     session_registered = False
     if not args.no_ui:
@@ -1620,21 +1821,9 @@ async def run(args) -> None:
             print(f"[share] LAN link: {lan_url}")
             await ui.set_share(lan_url, None)
 
-            async def _tunnel_later() -> None:
-                # cloudflared can take >10s to hand out a URL; never block
-                # startup or the ASR connection on it
-                nonlocal tunnel_proc
-                proc, public_url = await maybe_tunnel(ui.port)
-                tunnel_proc = proc
-                if public_url:
-                    public_url = public_url + suffix
-                    print(f"[share] public link: {public_url}  (cloudflared quick tunnel)")
-                    if ui:
-                        await ui.set_share(lan_url, public_url)
-                else:
-                    print("[share] no public link (cloudflared unavailable or timed out)")
-
-            share_task = asyncio.create_task(_tunnel_later())
+            share_task = asyncio.create_task(
+                maintain_tunnel(ui.port, ui, lan_url, suffix)
+            )  # Tunnel setup never blocks audio / ASR startup.
         try:
             webbrowser.open(url)
         except OSError as e:
@@ -1691,9 +1880,9 @@ async def run(args) -> None:
 
     def stats_snapshot() -> dict:
         now = time.time()
-        snapshot = {k: sum(1 for t in dq if now - t < 60)
-                    for k, dq in req_stats.items()}
-        recent_ark = [latency for at, latency in ark_latencies if now - at < 60]
+        trim_stats(req_stats, ark_latencies, now)
+        snapshot = {k: len(dq) for k, dq in req_stats.items()}
+        recent_ark = [latency for at, latency in ark_latencies]
         snapshot["ark_avg_ms"] = (
             round(sum(recent_ark) / len(recent_ark)) if recent_ark else None
         )
@@ -1726,6 +1915,7 @@ async def run(args) -> None:
             right = (msg.get("right") or "").strip()
             if wrong and right and wrong.lower() != right.lower():
                 corr_map[wrong.lower()] = right
+                corr_keys[wrong.lower()] = wrong
                 new_corrections[wrong] = right
                 corr["re"] = build_corr_re()
                 print(f"[corrections] {wrong} -> {right}")
@@ -1851,6 +2041,7 @@ async def run(args) -> None:
                     # definite re-recognition will never arrive
                     if not line_parts and last_live_line["text"]:
                         line_parts.append(last_live_line["text"])
+                        line_traces.append(dict(last_live_line))
                     if line_parts:
                         await flush_line()
                     replay_audio.clear()
@@ -1912,8 +2103,8 @@ async def run(args) -> None:
     cache: dict[tuple[str, str], str] = {}
     recent_context: deque[dict] = deque(maxlen=4)
     last_committed = {"text": ""}
-    last_live_line = {"text": ""}
-    reconnect_partial = {"text": ""}
+    last_live_line = traced("")
+    reconnect_partial = traced("")
     replay_guard = {"until": 0.0, "remaining": 0, "previous": ""}
     session_t0 = time.time()
     seg_seq = 0
@@ -1925,6 +2116,7 @@ async def run(args) -> None:
     # line and translated ONCE. This avoids fragmenting natural speech
     # (mid-sentence pauses) into tiny cards and flooding the translator.
     line_parts: list[str] = []
+    line_traces: list[dict] = []
     line_speaker: dict = {"id": None}  # speaker_id of the current live line
     line_misrec = {"v": False}  # lid said English but the text came out Chinese
     FINAL_PUNCT = ("。", "！", "？", ".", "!", "?", "…")
@@ -1941,6 +2133,12 @@ async def run(args) -> None:
     ark_latencies: deque[tuple[float, int]] = deque()
     refined_meta: dict[int, dict] = {}
     last_draft_result = {"text": "", "source": "", "src": "", "time": 0.0}
+    pending_records: dict[int, dict] = {}
+
+    def count_request(channel: str) -> None:
+        now = time.time()
+        trim_stats(req_stats, ark_latencies, now)
+        req_stats[channel].append(now)
 
     def engine_label(engine) -> str:
         return "ark" if engine is ark_polisher else args.translator
@@ -1968,12 +2166,12 @@ async def run(args) -> None:
                 await asyncio.sleep(waits[min(attempt - 1, len(waits) - 1)])
             request_meta = {}
             try:
-                req_stats["ark" if engine is ark_polisher else "volc_refined"].append(
-                    time.time()
-                )
+                count_request("ark" if engine is ark_polisher else "volc_refined")
                 if engine is ark_polisher:
-                    output = await engine.translate(
-                        text, src, tgt, context=context, request_meta=request_meta
+                    output = await asyncio.wait_for(
+                        engine.translate(text, src, tgt, context=context,
+                                         request_meta=request_meta),
+                        ARK_TIMEOUT_SECONDS,
                     )
                 else:
                     output = await engine.translate(text, src, tgt)
@@ -1983,7 +2181,7 @@ async def run(args) -> None:
                 key = type(e).__name__
                 fail_stats[key] = fail_stats.get(key, 0) + 1
                 if key == "RateLimitError":
-                    req_stats["ratelimit"].append(time.time())
+                    count_request("ratelimit")
                     waits = [5, 15]
                 print(f"[translate] attempt {attempt + 1} failed: {e} "
                       f"(totals: {fail_stats})", file=sys.stderr)
@@ -1999,6 +2197,7 @@ async def run(args) -> None:
                 }
                 if engine is ark_polisher:
                     ark_latencies.append((time.time(), latency_ms))
+                    trim_stats(req_stats, ark_latencies, time.time())
                 return output
             return None
         return None
@@ -2012,7 +2211,7 @@ async def run(args) -> None:
             return
         try:
             src, tgt = detect_direction(text)
-            req_stats["volc_draft"].append(time.time())
+            count_request("volc_draft")
             async with draft_sem:
                 translated = await translator.translate(text, src, tgt, lite=True)
         except Exception:
@@ -2031,12 +2230,23 @@ async def run(args) -> None:
     async def commit(text: str, seg_id: int, speaker: str | None,
                      misrec: bool = False, draft_snap: dict | None = None,
                      sentence_pair: str = "zh-en",
-                     detected_lang: str | None = None) -> None:
+                     detected_lang: str | None = None,
+                     trace: dict | None = None) -> None:
         src, tgt, detected, lang_source = resolve_direction(
             text, sentence_pair, detected_lang
         )
         arrow = f"{src.upper()}→{tgt.upper()}"
         ts = round(time.time() - session_t0, 1)
+        record = {"seq": seg_id, "speaker": speaker, "lang": src,
+                  "source": text, "translation": "⚠ 翻译未完成 translation incomplete",
+                  "pair": sentence_pair, "detected_lang": detected,
+                  "lang_source": lang_source, "language_conflict": bool(misrec),
+                  "translation_outcome": "incomplete", "refined_latency_ms": None,
+                  "refined_tier": None, "ts": ts, "time": time.strftime("%H:%M:%S")}
+        if trace and trace["raw"].strip() != text:
+            record.update(raw_source=trace["raw"].strip(),
+                          corrections_hit=list(dict.fromkeys(key for _, _, key in trace["hits"])))
+        pending_records[seg_id] = record
         if ui:
             await ui.emit({"type": "committed", "id": seg_id, "lang": src,
                            "source": text, "speaker": speaker, "ts": ts,
@@ -2054,7 +2264,7 @@ async def run(args) -> None:
                         "volc-mt", glossary
                     )
                 fast_engine = vi_fast_translator["engine"]
-                req_stats["volc_draft"].append(time.time())
+                count_request("volc_draft")
                 candidate = await fast_engine.translate(text, src, tgt, lite=True)
                 if accept_translation(text, candidate, tgt, seg_id,
                                       "provisional", "volc-mt"):
@@ -2074,6 +2284,7 @@ async def run(args) -> None:
                                            "provisional", "draft")):
                 provisional = ld["text"]
         if provisional is not None:
+            record["translation"] = provisional
             if ui:
                 await ui.emit({"type": "translation", "id": seg_id,
                                "text": provisional, "provisional": True})
@@ -2140,15 +2351,10 @@ async def run(args) -> None:
         elif ui and provisional is None:
             await ui.emit({"type": "translation", "id": seg_id, "text": translated})
         timing = refined_meta.get(seg_id, {})
-        record = {"seq": seg_id, "speaker": speaker, "lang": src,
-                  "source": text, "translation": translated,
-                  "pair": sentence_pair, "detected_lang": detected,
-                  "lang_source": lang_source,
-                  "language_conflict": bool(misrec),
-                  "translation_outcome": translation_outcome,
-                  "refined_latency_ms": timing.get("refined_latency_ms"),
-                  "refined_tier": timing.get("refined_tier"),
-                  "ts": ts, "time": time.strftime("%H:%M:%S")}
+        record.update(translation=translated, translation_outcome=translation_outcome,
+                      refined_latency_ms=timing.get("refined_latency_ms"),
+                      refined_tier=timing.get("refined_tier"))
+        pending_records.pop(seg_id, None)
         transcript_records.append(record)
         await asyncio.to_thread(_append_jsonl, jsonl_path, record)
         sys.stdout.write(
@@ -2205,9 +2411,11 @@ async def run(args) -> None:
     async def flush_line() -> None:
         nonlocal seg_seq
         text = "".join(line_parts).strip()
+        trace = join_traces(line_traces)
         speaker = line_speaker["id"]
         misrec = line_misrec["v"]
         line_parts.clear()
+        line_traces.clear()
         last_live_line["text"] = ""
         line_speaker["id"] = None
         line_misrec["v"] = False
@@ -2227,7 +2435,7 @@ async def run(args) -> None:
         translate_tasks.append(
             asyncio.create_task(commit(
                 text, seg_seq, speaker, misrec, draft_snap,
-                sentence_pair=session_pair["value"]
+                sentence_pair=session_pair["value"], trace=trace,
             )))
 
     async def silence_watchdog() -> None:
@@ -2290,6 +2498,7 @@ async def run(args) -> None:
         while True:  # ASR reconnect loop: survive network blips mid-meeting
             await wait_while_paused()
             got_last = False
+            handshake_status = None
             sent_audio_tail.clear()
             try:
                 async for event in asr.transcribe(reconnect_chunks()):
@@ -2305,6 +2514,7 @@ async def run(args) -> None:
                         if ui:
                             await ui.emit({"type": "status", "text": "connected"})
                     if event.text or event.utterances:
+                        reconnects = 0
                         last_activity["t"] = asyncio.get_running_loop().time()
                     packet_seg_seq = seg_seq
                     for utt in event.utterances:
@@ -2312,7 +2522,8 @@ async def run(args) -> None:
                                (utt.get("text") or "")[:16])
                         if utt.get("definite") and key not in committed and utt.get("text"):
                             committed.add(key)
-                            frag = correct(utt["text"])
+                            frag_trace = traced(utt["text"])
+                            frag = frag_trace["text"]
                             if (replay_guard["remaining"] > 0
                                     and loop.time() < replay_guard["until"]):
                                 replay_guard["remaining"] -= 1
@@ -2326,13 +2537,12 @@ async def run(args) -> None:
                                 last_committed["text"] = frag
                                 translate_tasks.append(asyncio.create_task(commit(
                                     frag, seg_seq, "0", sentence_pair=active_pair,
-                                    detected_lang=additions.get("language")
+                                    detected_lang=additions.get("language"), trace=frag_trace,
                                 )))
                                 continue
                             if reconnect_partial["text"]:
-                                frag = merge_reconnect_partial(
-                                    reconnect_partial["text"], frag
-                                )
+                                frag_trace = merge_traces(reconnect_partial, frag_trace)
+                                frag = frag_trace["text"]
                                 reconnect_partial["text"] = ""
                             speaker = (utt.get("additions") or {}).get("speaker_id")
                             # a speaker change is a natural turn boundary
@@ -2342,7 +2552,10 @@ async def run(args) -> None:
                             # language-boundary split, also inside a single fragment:
                             # a speaker can switch languages mid-utterance
                             lid = (utt.get("additions") or {}).get("lid_lang")
+                            offset = 0
                             for piece_lang, piece in split_lang_runs(frag):
+                                piece_trace = slice_trace(frag_trace, offset, offset + len(piece))
+                                offset += len(piece)
                                 # lid says English speech but the text came out
                                 # Chinese: LLM-ASR translated instead of
                                 # transcribing. Mark the line as suspect.
@@ -2354,6 +2567,7 @@ async def run(args) -> None:
                                 if not line_parts:
                                     line_speaker["id"] = speaker
                                 line_parts.append(piece)
+                                line_traces.append(piece_trace)
                                 current = "".join(line_parts).strip()
                                 if (current.endswith(FINAL_PUNCT)
                                         or len(current) >= MAX_LINE_CHARS
@@ -2365,14 +2579,13 @@ async def run(args) -> None:
                     # after the committed event has already cleared the strip.
                     packet_committed = seg_seq != packet_seg_seq
                     if line_parts or (event.text and not packet_committed):
-                        live_text = "" if packet_committed else correct(event.text)
+                        live_trace = traced("" if packet_committed else event.text)
                         if reconnect_partial["text"] and not line_parts:
-                            line = merge_reconnect_partial(
-                                reconnect_partial["text"], live_text
-                            )
+                            live_trace = merge_traces(reconnect_partial, live_trace)
                         else:
-                            line = "".join(line_parts) + live_text
-                        last_live_line["text"] = line.strip()
+                            live_trace = join_traces(line_traces + [live_trace])
+                        line = live_trace["text"]
+                        last_live_line.update(live_trace)
                         text = line.strip()
                         now = asyncio.get_running_loop().time()
                         # Draft budget: QPM is per-account and reserved for
@@ -2401,10 +2614,12 @@ async def run(args) -> None:
                         got_last = True
                         break
             except InvalidStatus as e:
-                # handshake rejected (401/403): bad key or service not
-                # activated — reconnecting would loop forever, so exit
-                sys.exit(f"[asr] handshake rejected (HTTP {e.response.status_code}); "
-                         f"check VOLC_ASR_API_KEY and service activation")
+                handshake_status = e.response.status_code
+                if not ever_connected:
+                    sys.exit(f"[asr] handshake rejected (HTTP {handshake_status}); "
+                             f"check VOLC_ASR_API_KEY and service activation")
+                print(f"[asr] handshake rejected mid-meeting (HTTP {handshake_status}); "
+                      f"retrying", file=sys.stderr)
             except (AsrError, ConnectionClosedError, OSError) as e:
                 if paused["v"]:
                     pass
@@ -2419,6 +2634,7 @@ async def run(args) -> None:
                     task.cancel()
                 draft_tasks.clear()
                 line_parts.clear()
+                line_traces.clear()
                 last_live_line["text"] = ""
                 reconnect_partial["text"] = ""
                 last_draft.update(text="")
@@ -2433,8 +2649,9 @@ async def run(args) -> None:
             reconnects += 1
             announced_connected = False
             if session_pair["value"] == "zh-en" and last_live_line["text"]:
-                reconnect_partial["text"] = last_live_line["text"]
+                reconnect_partial.update(last_live_line)
                 line_parts.clear()
+                line_traces.clear()
                 print(f"[asr] preserved interim across reconnect: "
                       f"{reconnect_partial['text']}", file=sys.stderr)
             # Keep the newest three seconds so a network flap does not eat the
@@ -2444,10 +2661,14 @@ async def run(args) -> None:
             print(f"[asr] reconnect audio tail: kept {len(replay_audio)} chunks, "
                   f"dropped {dropped}", file=sys.stderr)
             committed.clear()
-            delay = min(2 * reconnects, 10)
+            auth_rejected = handshake_status in (401, 403)
+            delay = min(2 * reconnects, 30 if auth_rejected else 10)
             print(f"[asr] reconnecting in {delay}s (attempt {reconnects})", file=sys.stderr)
             if ui:
-                await ui.emit({"type": "status", "text": f"ASR reconnecting… ({reconnects})"})
+                notice = (f"ASR auth/quota rejected (HTTP {handshake_status}), retrying… "
+                          f"check resource pack / key ({reconnects}, {delay}s)"
+                          if auth_rejected else f"ASR reconnecting… ({reconnects})")
+                await ui.emit({"type": "status", "text": notice})
             await asyncio.sleep(delay)
         await flush_line()
     except KeyboardInterrupt:
@@ -2464,6 +2685,7 @@ async def run(args) -> None:
         cleanup_started["v"] = True
         if reconnect_partial["text"] and not line_parts:
             line_parts.append(reconnect_partial["text"])
+            line_traces.append(dict(reconnect_partial))
             reconnect_partial["text"] = ""
         try:
             await flush_line()  # best effort; committed records persist regardless
@@ -2476,12 +2698,31 @@ async def run(args) -> None:
             share_task.cancel()  # terminates an in-flight cloudflared too
             cleanup_tasks.append(share_task)
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-        if tunnel_proc:
-            tunnel_proc.terminate()
         for task in draft_tasks:
             task.cancel()
-        if translate_tasks:
-            await asyncio.gather(*translate_tasks, return_exceptions=True)
+        await asyncio.gather(*draft_tasks, return_exceptions=True)
+        deadline = time.monotonic() + SHUTDOWN_TRANSLATION_SECONDS
+        while pending := [task for task in translate_tasks if not task.done()]:
+            done, _ = await asyncio.wait(
+                pending, timeout=max(0, deadline - time.monotonic()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                print_safe(f"[cleanup] translation wait reached "
+                           f"{SHUTDOWN_TRANSLATION_SECONDS:g}s; stopping {len(pending)} tasks",
+                           file=sys.stderr)
+                break
+        for task in translate_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*translate_tasks, return_exceptions=True)
+        for record in pending_records.values():
+            record["translation_outcome"] = "incomplete"
+            transcript_records.append(record)
+            _append_jsonl(jsonl_path, record)
+            print_safe(f"[transcript] seq={record['seq']} source saved; translation incomplete",
+                       file=sys.stderr)
+        transcript_records.sort(key=lambda record: record["seq"])
         if new_corrections:
             try:
                 atomic_merge_glossary(args.glossary, new_corrections)

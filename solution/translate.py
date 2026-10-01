@@ -27,6 +27,7 @@ except ImportError:  # optional: only needed for AK/SK auth
     AsyncArk = None
 
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+ARK_TIMEOUT_SECONDS = 20.0
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
@@ -288,11 +289,13 @@ class ArkTranslator:
         ak = os.environ.get("VOLC_ACCESSKEY") or os.environ.get("AccessKeyID")
         sk = os.environ.get("VOLC_SECRETKEY") or os.environ.get("SecretAccessKey")
         if bearer:
-            self.client = AsyncOpenAI(api_key=bearer, base_url=ARK_BASE_URL)
+            self.client = AsyncOpenAI(api_key=bearer, base_url=ARK_BASE_URL,
+                                     timeout=ARK_TIMEOUT_SECONDS, max_retries=0)
         elif ak and sk:
             if AsyncArk is None:
                 raise ImportError("pip install 'volcengine-python-sdk[ark]' for AK/SK auth")
-            self.client = AsyncArk(ak=ak, sk=sk)
+            self.client = AsyncArk(ak=ak, sk=sk,
+                                  timeout=ARK_TIMEOUT_SECONDS, max_retries=0)
         else:
             raise ValueError("Ark auth missing: set ARK_API_KEY, or AccessKeyID + SecretAccessKey")
         self.usage = [0, 0, 0]  # [prompt_tokens, completion_tokens, calls]
