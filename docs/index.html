@@ -67,6 +67,7 @@
 
   main { flex: 1; overflow-y: auto; scroll-behavior: smooth; position: relative; overscroll-behavior-y: contain; }
   .script { max-width: min(56rem, 94vw); margin: 0 auto; padding: 26px 24px 40px; }
+  #history-note { color: var(--ink-3); font-size: 12.5px; line-height: 1.5; margin: 0 0 16px; }
   body.fs-xl .script { max-width: min(80rem, 94vw); }
   .turn {
     display: grid; grid-template-columns: 8rem 1fr; gap: 0 1.4rem;
@@ -301,7 +302,10 @@
   <span id="live-dot">LIVE</span>
 </header>
 
-<main id="main"><div class="script" id="script"></div></main>
+<main id="main"><div class="script">
+  <p id="history-note" hidden>更早的字幕请用导出查看 earlier captions are in Export</p>
+  <div id="script"></div>
+</div></main>
 <button id="follow-btn">↓ 回到最新 latest</button>
 
 <div class="live">
@@ -412,7 +416,9 @@ const drafting = document.getElementById('drafting');
 const liveDot = document.getElementById('live-dot');
 const history = [];        // committed: {id, lang, source, speaker, ts}
 const transById = {};      // id -> translation
-const seenIds = new Set();
+const seenIds = new Set(); // full-session dedupe, independent of mounted DOM
+const DOM_LIMIT = 300;
+let replaying = false;
 const sessionNames = {};   // speaker id -> name (this page session)
 const SPCOLORS = ['#3D5A80','#5A7247','#A9752F','#7B4B67','#4E616C','#8C5040'];
 
@@ -434,8 +440,8 @@ main.addEventListener('scroll', () => {
   followBtn.style.display = pinned ? 'none' : 'block';
 });
 followBtn.onclick = () => { main.scrollTop = main.scrollHeight; };
-function scrollFollow() {
-  if (pinned) main.scrollTop = main.scrollHeight;
+function scrollFollow(instant = false) {
+  if (pinned) main.scrollTo({top: main.scrollHeight, behavior: instant ? 'instant' : 'auto'});
   else followBtn.style.display = 'block';
 }
 
@@ -629,21 +635,34 @@ function makeTurn(ev) {
   return turn;
 }
 
-function appendSentence(ev) {
-  if (seenIds.has(ev.id)) return;  // replay after reconnect must not duplicate
+function receiveSentence(ev) {
+  if (seenIds.has(ev.id)) return;
   seenIds.add(ev.id);
-  // NEVER history.push here: renderAll() iterates history and re-invokes
-  // this function — pushing would double the array on every view switch
-  // (and duplicate every export). The push lives in the committed handler.
+  history.push(ev);
+  if (!replaying) appendSentence(ev);
+}
+
+function updateHistoryNote() {
+  document.getElementById('history-note').hidden = history.length <= DOM_LIMIT;
+}
+
+function appendSentence(ev, follow = true) {
+  // Rendering never mutates history or dedupe: view switches and reconnects
+  // must not reinsert captions that have been evicted from the DOM.
   const turn = makeTurn(ev);
   script.appendChild(turn);
-  markLatest(turn);
-  scrollFollow();
+  if (script.childElementCount > DOM_LIMIT) script.firstElementChild.remove();
+  if (follow) {
+    markLatest(turn);
+    updateHistoryNote();
+    scrollFollow();
+  }
 
   // single-language fallback: translation missing 20s after commit -> show
   // the source dimmed instead of a permanent placeholder
-  setTimeout(() => {
-    if (!transById[ev.id] && currentView() !== 'both' && ev.lang !== currentView()) {
+  if (!transById[ev.id]) setTimeout(() => {
+    if (turn.isConnected && !transById[ev.id] && currentView() !== 'both'
+        && currentView() !== 'original' && ev.lang !== currentView()) {
       const tr = turn.querySelector('.trans');
       tr.classList.remove('pending');
       tr.classList.add('fallback');
@@ -654,10 +673,12 @@ function appendSentence(ev) {
 
 function addTranslation(ev) {
   transById[ev.id] = ev.text;
+  if (replaying) return;
   const turn = script.querySelector(`.turn[data-id="${ev.id}"]`);
   if (!turn) return;
   const orig = history.find(e => e.id === ev.id);
   const tr = turn.querySelector('.trans');
+  if (currentView() === 'original') return;
   if (orig && currentView() !== 'both' && orig.lang === currentView()) return; // shows source
   tr.classList.remove('pending');
   tr.classList.remove('fallback');
@@ -669,14 +690,16 @@ function addTranslation(ev) {
     tr.classList.remove('provisional');
     tr.textContent = ev.text;
   }
-  markLatest(turn);
   scrollFollow();
 }
 
 function renderAll() {
+  if (replaying) return;
   script.textContent = '';
-  seenIds.clear();
-  for (const ev of history) appendSentence(ev);
+  for (const ev of history.slice(-DOM_LIMIT)) appendSentence(ev, false);
+  markLatest(script.lastElementChild);
+  updateHistoryNote();
+  scrollFollow(true);
 }
 
 // ---- websocket ----
@@ -698,10 +721,15 @@ function connect() {
   const ws = new WebSocket(proto + location.host + location.pathname);
   wsConn = ws;
   ws.onopen = () => setLive('');
-  ws.onclose = () => { setLive('reconnecting…'); setTimeout(connect, 1500); };
+  ws.onclose = () => {
+    if (replaying) { replaying = false; renderAll(); }
+    setLive('reconnecting…'); setTimeout(connect, 1500);
+  };
   ws.onmessage = (m) => {
     const ev = JSON.parse(m.data);
-    if (ev.type === 'interim') { hearing.textContent = tailTrim(ev.text); }
+    if (ev.type === 'replay_start') { replaying = true; }
+    else if (ev.type === 'replay_end') { replaying = false; renderAll(); }
+    else if (ev.type === 'interim') { hearing.textContent = tailTrim(ev.text); }
     else if (ev.type === 'draft') {
       const v = currentView();
       if (v !== 'both' && ev.lang && ev.lang !== (v === 'zh' ? 'en' : 'zh')) {
@@ -713,8 +741,7 @@ function connect() {
     else if (ev.type === 'committed') {
       hearing.textContent = '';
       clearDraft();
-      if (!seenIds.has(ev.id)) history.push(ev);
-      appendSentence(ev);
+      receiveSentence(ev);
     }
     else if (ev.type === 'translation') addTranslation(ev);
     else if (ev.type === 'share') onShare(ev);
@@ -782,6 +809,7 @@ function demoReset() {
   script.textContent = '';
   history.length = 0;
   seenIds.clear();
+  updateHistoryNote();
   for (const k of Object.keys(transById)) delete transById[k];
   hearing.textContent = ''; clearDraft();
 }
@@ -800,8 +828,7 @@ async function playTurn(ev, id, ts) {
   hearing.textContent = ''; clearDraft();
   const committed = {id, lang: ev.lang,
     target_lang: ev.lang === 'zh' ? 'en' : 'zh', source: src, speaker: ev.sp, ts};
-  if (!seenIds.has(id)) history.push(committed);
-  appendSentence(committed);
+  receiveSentence(committed);
   await dsleep(250);
   addTranslation({id, text: ev.draft, provisional: true});
   await dsleep(1500);

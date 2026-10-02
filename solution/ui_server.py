@@ -14,6 +14,7 @@ Events:
 - {"type": "devices", ...}                host-only audio device state
 - {"type": "committed", "id": int, "lang": "zh"|"en"|"vi", "source": str, "speaker": str|None}
 - {"type": "translation", "id": int, "text": str}
+- {"type": "replay_start"|"replay_end"}  batch history without per-event layout
 """
 
 from __future__ import annotations
@@ -96,6 +97,7 @@ class CaptionUI:
                 # history can exceed it; blocking here only stalls this client's
                 # own handshake, never the pipeline. seenIds dedupes any overlap
                 # with live events once the outbox registers below.
+                await ws.send('{"type":"replay_start"}')
                 if self.share:
                     await ws.send(json.dumps(
                         {"type": "share", **self.share}, ensure_ascii=False))
@@ -105,6 +107,9 @@ class CaptionUI:
                         ensure_ascii=False))
                 for event in self.history:
                     await ws.send(json.dumps(event, ensure_ascii=False))
+                # Queue the boundary BEFORE registering, with no intervening
+                # await: live captions cannot overtake it or fall into a gap.
+                outbox.put_nowait('{"type":"replay_end"}')
                 self.clients[outbox] = (task, ws)
                 # control channel: corrections, toggles. A connection earns
                 # the control token only if it is loopback AND not tunneled
