@@ -33,7 +33,8 @@
     "remoker": "Merkle",
     "GNID": "JoyID",
     "CKBG": "CKBA",
-    "CICCON": "CKCon"
+    "CICCON": "CKCon",
+    "UTSO": "UTXO"
   },
   "terms": [
     {
