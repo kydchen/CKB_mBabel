@@ -386,6 +386,7 @@
     <span class="close" data-close="export-mask">✕</span>
     <button class="hbtn lang-flip">EN</button>
     <h2>导出 Export</h2>
+    <p id="export-scope" hidden style="color:var(--ink-3);font-size:13px"><span class="zh">本页导出从加入时最近 300 句起，完整记录由主持人保存</span><span class="en">Export covers the last 300 captions before you joined; the host keeps the full record</span></p>
     <label><input type="radio" name="exp-kind" value="original"> 原文 Original only</label>
     <label><input type="radio" name="exp-kind" value="translation"> 译文 Translation only</label>
     <label><input type="radio" name="exp-kind" value="bilingual" checked> 双语对照 Original + Translation</label>
@@ -725,8 +726,14 @@ function connect() {
     if (replaying) { replaying = false; renderAll(); }
     setLive('reconnecting…'); setTimeout(connect, 1500);
   };
-  ws.onmessage = (m) => {
-    const ev = JSON.parse(m.data);
+  ws.onmessage = m => handleEvent(JSON.parse(m.data));
+}
+function handleEvent(ev) {
+    if (ev.type === 'replay') {
+      document.getElementById('export-scope').hidden = !ev.truncated;
+      for (const event of ev.events) handleEvent(event);
+      return;
+    }
     if (ev.type === 'replay_start') { replaying = true; }
     else if (ev.type === 'replay_end') { replaying = false; renderAll(); }
     else if (ev.type === 'interim') { hearing.textContent = tailTrim(ev.text); }
@@ -754,7 +761,6 @@ function connect() {
       if (el) el.textContent =
         `近 60 秒请求 60s requests: 草稿 draft ${ev.volc_draft} · 精翻 refined(ark) ${ev.ark} · 限流 rate-limited ${ev.ratelimit}`;
     }
-  };
 }
 // ================= DEMO DRIVER (GitHub Pages) =================
 // No live socket here: this page replays a scripted CKB dev standup so

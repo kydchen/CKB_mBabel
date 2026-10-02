@@ -15,6 +15,7 @@ Events:
 - {"type": "committed", "id": int, "lang": "zh"|"en"|"vi", "source": str, "speaker": str|None}
 - {"type": "translation", "id": int, "text": str}
 - {"type": "replay_start"|"replay_end"}  batch history without per-event layout
+- {"type": "replay", "events": [...], "truncated": bool}  one history frame
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from websockets.datastructures import Headers
 from websockets.http11 import Response
 
 HTML_PATH = os.path.join(os.path.dirname(__file__), "ui.html")
+REPLAY_LIMIT = 300  # matches the browser's DOM_LIMIT
 
 
 class CaptionUI:
@@ -51,8 +53,7 @@ class CaptionUI:
 
     async def set_share(self, lan: str | None, public: str | None) -> None:
         self.share = {k: v for k, v in (("lan", lan), ("public", public)) if v}
-        if self.share:
-            await self.emit({"type": "share", **self.share})
+        await self.emit({"type": "share", **self.share})
 
     async def set_pair(self, pair: str) -> None:
         self.pair = pair
@@ -80,47 +81,47 @@ class CaptionUI:
             return None
 
         async def ws_handler(ws):
+            host = (ws.remote_address or ("",))[0]
+            req_headers = getattr(getattr(ws, "request", None), "headers", {})
+            tunneled = "Cf-Connecting-Ip" in req_headers or "Cf-Ray" in req_headers
+            is_host = host in ("127.0.0.1", "::1") and not tunneled
+            # Select whole sentence IDs, including every translation stage.
+            ids = list(dict.fromkeys(ev["id"] for ev in self.history
+                                     if ev["type"] == "committed"))
+            truncated = not is_host and len(ids) > REPLAY_LIMIT
+            selected = set(ids[-REPLAY_LIMIT:]) if truncated else None
+            events = [{"type": "replay_start"}, {"type": "share", **self.share}]
+            if self.pair:
+                events.append({"type": "pair_state", "pair": self.pair})
+            events.extend(ev for ev in self.history
+                          if selected is None or ev["id"] in selected)
+            events.append({"type": "replay_end"})
+            replay = json.dumps({"type": "replay", "events": events,
+                                 "truncated": truncated}, ensure_ascii=False)
             # each client has a bounded outbox; a stalled client is dropped,
             # never allowed to backpressure the caption pipeline
             outbox: asyncio.Queue = asyncio.Queue(maxsize=100)
 
-            async def sender():
+            async def sender(initial):
                 try:
+                    await ws.send(initial)
+                    del initial  # do not retain a per-viewer snapshot all meeting
                     while True:
                         await ws.send(await outbox.get())
                 except Exception:
                     pass
 
-            task = asyncio.create_task(sender())
+            task = asyncio.create_task(sender(replay))
+            del replay, events, ids, selected
             try:
-                # replay directly with awaited sends: the outbox is bounded and
-                # history can exceed it; blocking here only stalls this client's
-                # own handshake, never the pipeline. seenIds dedupes any overlap
-                # with live events once the outbox registers below.
-                await ws.send('{"type":"replay_start"}')
-                if self.share:
-                    await ws.send(json.dumps(
-                        {"type": "share", **self.share}, ensure_ascii=False))
-                if self.pair:
-                    await ws.send(json.dumps(
-                        {"type": "pair_state", "pair": self.pair},
-                        ensure_ascii=False))
-                for event in self.history:
-                    await ws.send(json.dumps(event, ensure_ascii=False))
-                # Queue the boundary BEFORE registering, with no intervening
-                # await: live captions cannot overtake it or fall into a gap.
-                outbox.put_nowait('{"type":"replay_end"}')
-                self.clients[outbox] = (task, ws)
-                # control channel: corrections, toggles. A connection earns
-                # the control token only if it is loopback AND not tunneled
-                # (cloudflared marks forwarded traffic with Cf-* headers).
-                host = (ws.remote_address or ("",))[0]
-                req_headers = getattr(getattr(ws, "request", None), "headers", {})
-                tunneled = "Cf-Connecting-Ip" in req_headers or "Cf-Ray" in req_headers
-                if host in ("127.0.0.1", "::1") and not tunneled:
-                    self.control_clients.add(outbox)
-                    await ws.send(json.dumps(
+                # Snapshot, sender creation and registration contain no await.
+                # Live events queue immediately, always AFTER replay_end in the
+                # sender's first frame. No replay-time gap or concurrent sends.
+                if is_host:
+                    outbox.put_nowait(json.dumps(
                         {"type": "control_token", "token": self.control_token}))
+                    self.control_clients.add(outbox)
+                self.clients[outbox] = (task, ws)
                 try:
                     async for raw in ws:
                         if not self.on_control:
@@ -138,9 +139,11 @@ class CaptionUI:
                 self.control_clients.discard(outbox)
                 self.clients.pop(outbox, None)
                 task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
         self.server = await websockets.serve(
-            ws_handler, self.host, self.port, process_request=process_request
+            ws_handler, self.host, self.port, process_request=process_request,
+            ping_timeout=60,
         )
 
     async def emit(self, event: dict) -> None:

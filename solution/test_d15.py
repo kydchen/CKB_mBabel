@@ -169,13 +169,14 @@ async def tunnel_check(root):
         # stderr remains tee'd to disk; subprocesses are local Python only.
         await asyncio.wait_for(babel.maintain_tunnel(0, ui, "http://lan/caption", "/caption"), 10)
     data = Path(path).read_text()
-    assert data.count("x") >= payload_bytes * 2 and "[tunnel]" in data
-    assert len(children) == 2 and all(p.returncode == 0 for p in children)
+    assert data.count("x") >= payload_bytes * 4 and "[tunnel]" in data
+    assert len(children) == 4 and all(p.returncode == 0 for p in children)
     shares = [v["public"] for v in ui.events if v["type"] == "share"]
-    assert shares == ["https://offline-0.trycloudflare.com/caption", None,
-                      "https://offline-1.trycloudflare.com/caption", None], shares
+    assert shares == [url for n in range(4) for url in
+                      (f"https://offline-{n}.trycloudflare.com/caption", None)] + [None], shares
     notices = [v["text"] for v in ui.events if v["type"] == "tunnel_state"]
-    assert any("tunnel" in v.lower() for v in notices)
+    assert notices[-1] == ("公网链接持续不可用，请检查网络 / "
+                           "Public link keeps failing, check the network")
     statuses = [v["text"] for v in ui.events if v["type"] == "status"]
     assert not any("tunnel" in v.lower() for v in statuses), statuses  # LIVE pill stays ASR-only
 

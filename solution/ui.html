@@ -90,17 +90,18 @@
   }
   #candidate-banner.show { display: block; }
   #candidate-banner:hover { background: var(--strip); }
-  #tunnel-banner:not([hidden]) {
+  .link-banner:not([hidden]) {
     display: flex; align-items: center; gap: 12px; padding: 8px 28px;
     background: var(--accent-soft); border-bottom: 1px solid var(--hair);
   }
-  #tunnel-notice, #tunnel-dismiss {
+  #tunnel-notice, #tunnel-dismiss, #viewer-link {
     background: none; border: 0; color: var(--accent); cursor: pointer;
     font: 13px/1.5 var(--sans); text-align: left;
   }
-  #tunnel-notice { flex: 1; }
+  #tunnel-notice, #viewer-link { flex: 1; }
+  #viewer-link { text-decoration: none; }
   #tunnel-dismiss { padding: 2px 6px; font-size: 20px; }
-  #tunnel-banner button:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
+  .link-banner :focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
   @keyframes breathe { 50% { opacity: .35; } }
   body.fs-xl header { display: none; }
   #pres-exit {
@@ -436,9 +437,12 @@
 </header>
 <div id="device-warning"></div>
 <button id="candidate-banner" type="button"></button>
-<div id="tunnel-banner" hidden>
+<div id="tunnel-banner" class="link-banner" hidden>
   <button id="tunnel-notice" type="button"></button>
   <button id="tunnel-dismiss" type="button" aria-label="关闭提醒 Dismiss notice">×</button>
+</div>
+<div id="viewer-link-banner" class="link-banner" hidden>
+  <a id="viewer-link">链接已更换，点此继续 Link changed, tap to continue</a>
 </div>
 
 <main id="main"><div class="script">
@@ -575,6 +579,7 @@
       <p class="en" style="color:var(--ink-3);font-size:13px">The public link exposes the full transcript. Share only with attendees.</p>
     </div>
     <h3>导出 Export</h3>
+    <p id="export-scope" hidden style="color:var(--ink-3);font-size:13px"><span class="zh">本页导出从加入时最近 300 句起，完整记录由主持人保存</span><span class="en">Export covers the last 300 captions before you joined; the host keeps the full record</span></p>
     <label><input type="radio" name="exp-kind" value="original"> 原文 Original only</label>
     <label><input type="radio" name="exp-kind" value="translation"> 译文 Translation only</label>
     <label><input type="radio" name="exp-kind" value="bilingual" checked> 双语对照 Original + Translation</label>
@@ -1875,8 +1880,14 @@ function connect() {
     setLive('reconnecting…');
     setTimeout(connect, 1500 + (Math.random() - 0.5) * 1000);
   };
-  ws.onmessage = (m) => {
-    const ev = JSON.parse(m.data);
+  ws.onmessage = m => handleEvent(JSON.parse(m.data));
+}
+function handleEvent(ev) {
+    if (ev.type === 'replay') {
+      document.getElementById('export-scope').hidden = !ev.truncated;
+      for (const event of ev.events) handleEvent(event);
+      return;
+    }
     if (ev.type === 'replay_start') { replaying = true; }
     else if (ev.type === 'replay_end') { replaying = false; renderAll(); }
     else if (ev.type === 'interim') { hearing.textContent = tailTrim(ev.text); }
@@ -1898,12 +1909,14 @@ function connect() {
     else if (ev.type === 'pair_state') applyPair(ev.pair);
     else if (ev.type === 'share') onShare(ev);
     else if (ev.type === 'tunnel_state') {
+      tunnelNoticeText = ev.text || '';
       tunnelNoticeSeen = true;
       if (controlToken) showTunnelNotice();
       else tunnelNoticePending = true;
     }
     else if (ev.type === 'control_token') {
       controlToken = ev.token;
+      document.getElementById('viewer-link-banner').hidden = true;
       if (tunnelNoticePending) showTunnelNotice();
       document.getElementById('device-btn').style.display = '';
       document.getElementById('pair-select').disabled = false;
@@ -1963,7 +1976,6 @@ function connect() {
         `精翻 refined(ark/${ev.ark_tier || 'default'}) ${ev.ark} · 平均延迟 avg ${avg} · ` +
         `限流 rate-limited ${ev.ratelimit}`;
     }
-  };
 }
 connect();
 
@@ -2005,6 +2017,7 @@ let shareInfo = {};
 let publicLinkSeen = false;
 let tunnelNoticeSeen = false;
 let tunnelNoticePending = false;
+let tunnelNoticeText = '';
 let qrCanvases = {};
 let projectedKey = null;
 let projectionTrigger = null;
@@ -2024,6 +2037,16 @@ function onShare(ev) {
   renderShareLinks();
   if (controlToken && previous !== shareInfo.public && (publicLinkSeen || tunnelNoticeSeen)) showTunnelNotice();
   if (shareInfo.public) publicLinkSeen = true;
+  updateViewerLink();
+}
+function updateViewerLink() {
+  const banner = document.getElementById('viewer-link-banner');
+  // The only public provider in this app is the account-free Quick Tunnel.
+  // Localhost/LAN viewers must not be moved onto the public connection.
+  const isPublicViewer = location.hostname.endsWith('.trycloudflare.com');
+  const changed = shareInfo.public && new URL(shareInfo.public).host !== location.host;
+  banner.hidden = !!controlToken || !isPublicViewer || !changed;
+  document.getElementById('viewer-link').href = shareInfo.public || '';
 }
 function qrCanvas(url) {
   const qr = qrcodegen.QrCode.encodeText(url, qrcodegen.QrCode.Ecc.MEDIUM);
@@ -2079,7 +2102,8 @@ document.addEventListener('fullscreenchange', () => {
 function showTunnelNotice() {
   if (!controlToken) return;
   tunnelNoticePending = false;
-  document.getElementById('tunnel-notice').textContent = shareInfo.public
+  document.getElementById('tunnel-notice').textContent = tunnelNoticeText.includes('check the network')
+    ? tunnelNoticeText : shareInfo.public
     ? '公网链接已更换，请重新展示二维码 Public link changed, re-show the QR'
     : '公网链接不可用，仅局域网 Public link unavailable, LAN only';
   tunnelBanner.hidden = false;

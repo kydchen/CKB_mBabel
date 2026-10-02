@@ -10,7 +10,7 @@ assert(!/<script\b[^>]*\bsrc=/.test(html), 'QR must work without external script
 const fn = name => html.match(new RegExp('function ' + name + '\\([^]*?\\n}'))[0];
 const sandbox = {
   URL, shareInfo: {}, controlToken: null, publicLinkSeen: false, tunnelNoticeSeen: false,
-  renderShareLinks() {}, notices: 0, showTunnelNotice() { sandbox.notices++; },
+  renderShareLinks() {}, updateViewerLink() {}, notices: 0, showTunnelNotice() { sandbox.notices++; },
   document: {createElement() {
     const fills = [];
     const ctx = {fillRect(...args) { fills.push([this.fillStyle, ...args]); }};

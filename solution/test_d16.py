@@ -35,12 +35,15 @@ async def check():
             self.events = []
             self.live_id = live_id
             self.drained = asyncio.Event()
+            self.replayed = asyncio.Event()
 
         async def send(self, raw):
             event = json.loads(raw)
-            self.events.append(event)
-            if event.get("id") == 2 and self.live_id == 4:
+            self.events.extend(event["events"] if event["type"] == "replay" else [event])
+            if event.get("type") == "replay" and self.live_id == 4:
                 await caption(3)  # arrives while awaiting a historical send
+            if event.get("type") == "replay":
+                self.replayed.set()
             if event.get("id") == self.live_id:
                 self.drained.set()
             await asyncio.sleep(0)
@@ -49,6 +52,7 @@ async def check():
             return self
 
         async def __anext__(self):
+            await self.replayed.wait()
             await caption(self.live_id)  # first live event after registration
             await asyncio.wait_for(self.drained.wait(), .5)
             raise StopAsyncIteration
@@ -59,9 +63,9 @@ async def check():
         events = socket.events
         assert events[0] == {"type": "replay_start"}
         boundary = events.index({"type": "replay_end"})
-        assert [ev["id"] for ev in events[1:boundary]] == list(range(1, live_id))
-        assert events[boundary + 1:] == [{"type": "committed", "id": live_id,
-                                         "source": str(live_id)}]
+        assert [ev["id"] for ev in events[1:boundary] if "id" in ev] == list(range(1, 3 if live_id == 4 else 5))
+        live_ids = [ev["id"] for ev in events[boundary + 1:] if "id" in ev]
+        assert live_ids == ([3, 4] if live_id == 4 else [5]), events
         assert not ui.clients and not ui.control_clients
     assert [ev["id"] for ev in ui.history] == [1, 2, 3, 4, 5]
 

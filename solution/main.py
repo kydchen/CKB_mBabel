@@ -31,6 +31,8 @@ from collections import Counter, deque
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from urllib.parse import urlsplit
 
+import httpx
+
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from asr_client import AsrConfig, AsrError, VolcAsrClient
@@ -98,6 +100,11 @@ CLAUSE_FLUSH_CHARS = 80
 CLAUSE_ENDINGS = ("，", "、", "；", ",", ";")
 SESSION_DIR = os.path.join(os.path.expanduser("~"), ".mbabel")
 SHUTDOWN_TRANSLATION_SECONDS = 30.0
+TUNNEL_PROBE_SECONDS = 60.0
+TUNNEL_PROBE_TIMEOUT = 10.0
+TUNNEL_GRACE_SECONDS = 90.0
+TUNNEL_RESTART_LIMIT = 3
+TUNNEL_RESTART_WINDOW = 3600.0
 
 
 class LogTee:
@@ -1598,27 +1605,102 @@ async def stop_tunnel(proc) -> None:
 
 
 async def maintain_tunnel(port: int, ui, lan_url: str, suffix: str) -> None:
-    for attempt in range(2):  # One automatic restart per meeting, never a loop.
-        proc = None
-        try:
-            proc, public_url = await maybe_tunnel(port)
-            if public_url:
-                public_url += suffix
-                print(f"[share] public link: {public_url}  (cloudflared quick tunnel)")
-                await ui.set_share(lan_url, public_url)
-                code = await proc.wait()
-                notice = f"Public tunnel exited ({code})"
-            else:
-                notice = "Public tunnel unavailable (cloudflared missing or timed out)"
-            await ui.set_share(lan_url, None)
-            notice += "; restarting once…" if attempt == 0 else "; LAN only"
+    import shutil
+
+    proc = old_proc = None
+    restarts: deque[float] = deque()
+    clock = time.monotonic
+    failures = 0
+    try:
+        proc, public_url = await maybe_tunnel(port)
+        if not proc and not shutil.which("cloudflared"):
+            # Not installed is not a network failure: say so once, never retry.
+            notice = "Public tunnel unavailable (cloudflared not installed); LAN only"
             print(f"[share] {notice}", file=sys.stderr)
-            # Host-only: the shared status channel drives the LIVE pill, which
-            # must reflect ASR health, not tunnel churn (captions keep flowing).
             await ui.emit_control({"type": "tunnel_state", "text": notice})
-        finally:
-            if proc:
-                await stop_tunnel(proc)
+            return
+        started = clock()
+        next_probe = started + TUNNEL_PROBE_SECONDS
+        if public_url:
+            public_url += suffix
+            print(f"[share] public link: {public_url}  (cloudflared quick tunnel)")
+            await ui.set_share(lan_url, public_url)
+        while True:
+            if proc and public_url:
+                try:
+                    code = await asyncio.wait_for(proc.wait(), max(.001, next_probe - clock()))
+                    reason = f"Public tunnel exited ({code})"
+                    await ui.set_share(lan_url, None)
+                except asyncio.TimeoutError:
+                    next_probe = clock() + TUNNEL_PROBE_SECONDS
+                    healthy, detail = await probe_public_url(public_url)
+                    if healthy:
+                        failures = 0
+                        continue
+                    in_grace = clock() - started < TUNNEL_GRACE_SECONDS
+                    if not in_grace:
+                        failures += 1
+                    print(f"[tunnel-health] probe failed: {detail}; "
+                          f"{'grace period' if in_grace else f'{failures}/3'}",
+                          file=sys.stderr)
+                    if in_grace or failures < 3:
+                        continue
+                    reason = "Three consecutive public-link probes failed"
+            else:
+                reason = "Public tunnel unavailable (cloudflared missing or timed out)"
+            now = clock()
+            while restarts and now - restarts[0] >= TUNNEL_RESTART_WINDOW:
+                restarts.popleft()
+            if len(restarts) >= TUNNEL_RESTART_LIMIT:
+                notice = ("公网链接持续不可用，请检查网络 / "
+                          "Public link keeps failing, check the network")
+                print(f"[tunnel-health] giving up: {reason}; {notice}", file=sys.stderr)
+                await ui.set_share(lan_url, None)
+                await ui.emit_control({"type": "tunnel_state", "text": notice})
+                return
+            restarts.append(now)  # exits and failed health probes share this budget
+            print(f"[tunnel-health] replacing ({len(restarts)}/3 this hour): {reason}",
+                  file=sys.stderr)
+            replacement, new_url = await maybe_tunnel(port)
+            if not new_url:
+                print("[tunnel-health] replacement setup failed", file=sys.stderr)
+                await ui.emit_control({"type": "tunnel_state", "text":
+                                       "Replacement tunnel unavailable; retrying"})
+                # Keep a still-running old tunnel while retrying, never clear
+                # it merely because replacement setup failed.
+                await asyncio.sleep(TUNNEL_PROBE_SECONDS)
+                continue
+            old_proc, proc = proc, replacement
+            public_url = new_url + suffix
+            started, failures = clock(), 0
+            next_probe = started + TUNNEL_PROBE_SECONDS
+            print(f"[tunnel-health] replacement ready: {public_url}", file=sys.stderr)
+            await ui.set_share(lan_url, public_url)
+            await ui.emit_control({"type": "tunnel_state", "text":
+                                   "Public link changed, re-show the QR"})
+            if old_proc:
+                await stop_tunnel(old_proc)  # new URL is published BEFORE old shutdown
+                old_proc = None
+    finally:
+        for child in (old_proc, proc):
+            if child:
+                await stop_tunnel(child)
+
+
+async def probe_public_url(url: str) -> tuple[bool, str]:
+    """Read public HTTP status without blocking audio or downloading the page."""
+    async def get_status():
+        # Reuse the existing HTTPX dependency: cancellation closes the socket,
+        # unlike a blocking worker thread which could delay process shutdown.
+        async with httpx.AsyncClient(timeout=TUNNEL_PROBE_TIMEOUT, follow_redirects=True) as client:
+            async with client.stream("GET", url) as response:
+                return response.status_code
+
+    try:
+        status = await asyncio.wait_for(get_status(), TUNNEL_PROBE_TIMEOUT)
+        return status == 200, f"HTTP {status}"
+    except Exception as error:
+        return False, " ".join(f"{type(error).__name__}: {error}".split())[:200]
 
 
 async def run(args) -> None:

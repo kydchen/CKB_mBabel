@@ -387,7 +387,8 @@ class ArkTranslator:
             out = (resp.choices[0].message.content or "").strip()
             if not _looks_like_reasoning(out):
                 return out
-            print("[translate] reasoning-leak detected, retrying once",
+            snippet = " ".join(out[:200].split())
+            print(f"[translate] reasoning-leak detected, retrying once; rejected={snippet!r}",
                   file=sys.stderr)
         return out  # rare: return as-is rather than drop the line
 
