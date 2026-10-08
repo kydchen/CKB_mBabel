@@ -434,13 +434,25 @@ syncStripH();
 
 // ---- scroll follow (main scrolls) ----
 let pinned = true;
+let lastReaderInput = -Infinity;
 const followBtn = document.getElementById('follow-btn');
 function nearBottom() { return main.scrollHeight - main.scrollTop - main.clientHeight < 80; }
+// Smooth follow animations and DOM trimming emit scroll events far from the
+// bottom. Only the reader's own scrolling may unpin, never a programmatic one.
+function readerInput() { lastReaderInput = performance.now(); }
+main.addEventListener('wheel', readerInput, {passive: true});
+main.addEventListener('touchmove', readerInput, {passive: true});
+main.addEventListener('mousedown', e => { if (e.offsetX >= main.clientWidth) readerInput(); });
+document.addEventListener('keydown', e => {
+  if (['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' '].includes(e.key)
+      && !e.target.closest('input, textarea, select, [contenteditable]')) readerInput();
+});
 main.addEventListener('scroll', () => {
-  pinned = nearBottom();
+  if (nearBottom()) pinned = true;
+  else if (performance.now() - lastReaderInput < 1000) pinned = false;
   followBtn.style.display = pinned ? 'none' : 'block';
 });
-followBtn.onclick = () => { main.scrollTop = main.scrollHeight; };
+followBtn.onclick = () => { pinned = true; lastReaderInput = -Infinity; main.scrollTop = main.scrollHeight; };
 function scrollFollow(instant = false) {
   if (pinned) main.scrollTo({top: main.scrollHeight, behavior: instant ? 'instant' : 'auto'});
   else followBtn.style.display = 'block';
