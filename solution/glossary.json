@@ -34,7 +34,16 @@
     "GNID": "JoyID",
     "CKBG": "CKBA",
     "CICCON": "CKCon",
-    "UTSO": "UTXO"
+    "UTSO": "UTXO",
+    "nos talk": "Nervos Talk",
+    "proof of by": "Proof of Buy",
+    "proof of bye": "Proof of Buy",
+    "Fly Client": "FlyClient",
+    "CK Boost": "CKBoost",
+    "CK Builder": "CKBuilder",
+    "Bitcoin Lite": "Bitcoin Light",
+    "Groth 16": "Groth16",
+    "Xinran": "XinRan"
   },
   "terms": [
     {
@@ -152,6 +161,106 @@
     {
       "source": "智能合约",
       "target": "smart contract"
+    },
+    {
+      "source": "写放大",
+      "target": "write amplification"
+    },
+    {
+      "source": "交易池",
+      "target": "transaction pool"
+    },
+    {
+      "source": "二级发行",
+      "target": "secondary issuance"
+    },
+    {
+      "source": "计票",
+      "target": "vote counting"
+    },
+    {
+      "source": "挑战期",
+      "target": "challenge period"
+    },
+    {
+      "source": "存储键",
+      "target": "storage key"
+    },
+    {
+      "source": "用例",
+      "target": "test case"
+    },
+    {
+      "source": "断言",
+      "target": "assertion"
+    },
+    {
+      "source": "测试树",
+      "target": "test tree"
+    },
+    {
+      "source": "覆盖评审",
+      "target": "coverage review"
+    },
+    {
+      "source": "告警",
+      "target": "alert"
+    },
+    {
+      "source": "机会卡",
+      "target": "opportunity card"
+    },
+    {
+      "source": "多跳路由",
+      "target": "multi-hop routing"
+    },
+    {
+      "source": "资产会话",
+      "target": "asset session"
+    },
+    {
+      "source": "舟舟",
+      "target": "Zhouzhou"
+    },
+    {
+      "source": "朱砂",
+      "target": "Cinnabar"
+    },
+    {
+      "source": "自我进化",
+      "target": "self-evolving"
+    },
+    {
+      "source": "因果推断",
+      "target": "causal inference"
+    },
+    {
+      "source": "Watchtower",
+      "target": "瞭望塔"
+    },
+    {
+      "source": "preimage",
+      "target": "原像"
+    },
+    {
+      "source": "reorg",
+      "target": "链重组"
+    },
+    {
+      "source": "Sybil",
+      "target": "女巫"
+    },
+    {
+      "source": "syscall",
+      "target": "系统调用"
+    },
+    {
+      "source": "Nervos Community Catalyst",
+      "target": "Nervos Community Catalyst"
+    },
+    {
+      "source": "Payment Trinity",
+      "target": "Payment Trinity"
     }
   ]
 }
