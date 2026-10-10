@@ -793,11 +793,79 @@ async def audio_mixer_check(temp_dir):
     assert mixer.microphone == "MacBook Pro Microphone"
     assert restarts == [True]
     assert "disappeared" in mixer.warning
+    with open(config, encoding="utf-8") as f:
+        assert json.load(f)["microphone"] == "Wireless Microphone", "fallback must not overwrite preference"
+
+    states = []
+
+    async def notified(state):
+        states.append(state)
+
+    mixer.on_state = notified
+    with patch.object(babel, "discover_audio_devices",
+                      side_effect=[present, unplugged] * 4):
+        for _ in range(8):
+            await mixer.scan()
+    assert restarts == [True], "one-scan reconnect flaps must not restart"
+    with patch.object(babel, "discover_audio_devices", return_value=present):
+        await mixer.scan()
+        assert mixer.microphone == "MacBook Pro Microphone"
+        await mixer.scan()
+        await mixer.scan()
+    assert restarts == [True, True], "stable reconnect must restart exactly once"
+    assert mixer.microphone == "Wireless Microphone"
+    assert states[-1]["warning"] == "Microphone reconnected: Wireless Microphone"
+    with open(config, encoding="utf-8") as f:
+        assert json.load(f)["microphone"] == "Wireless Microphone"
+
+    # A saved preference also survives starting while that mic is absent.
+    reloaded = babel.AudioMixer(asyncio.Queue(), config)
+    with patch.object(babel, "discover_audio_devices", return_value=unplugged):
+        await reloaded.scan(initial=True)
+        with open(config, encoding="utf-8") as f:
+            assert json.load(f)["microphone"] == "Wireless Microphone"
+        await reloaded.apply("MacBook Pro Microphone", True, "MacBook Pro Speakers")
+    with open(config, encoding="utf-8") as f:
+        assert json.load(f)["microphone"] == "MacBook Pro Microphone", "explicit choice replaces preference"
+    with patch.object(babel, "discover_audio_devices", return_value=present):
+        await reloaded.scan()
+        await reloaded.scan()
+    assert reloaded.microphone == "MacBook Pro Microphone", "manual choice must prevent auto-return"
+
+    async def failed_reconnect(refresh):
+        restarts.append(refresh)
+        if mixer.microphone == "Wireless Microphone":
+            raise RuntimeError("receiver is not ready")
+
+    with patch.object(babel, "discover_audio_devices", return_value=unplugged):
+        await mixer.scan()
+    mixer.restart_streams = failed_reconnect
+    with patch.object(babel, "discover_audio_devices", return_value=present):
+        await mixer.scan()
+        await mixer.scan()
+    assert mixer.microphone == "MacBook Pro Microphone", "failed reopen must keep the fallback usable"
+    with open(config, encoding="utf-8") as f:
+        assert json.load(f)["microphone"] == "Wireless Microphone"
+    # An unopenable but still enumerated receiver must not be retried every
+    # two polls (each retry glitches live audio); it may retry after it leaves.
+    failed_attempts = len(restarts)
+    with patch.object(babel, "discover_audio_devices", return_value=present):
+        for _ in range(6):
+            await mixer.scan()
+    assert len(restarts) == failed_attempts, "failed restore must not retry while the device stays"
+    with patch.object(babel, "discover_audio_devices", return_value=unplugged):
+        await mixer.scan()
+    with patch.object(babel, "discover_audio_devices", return_value=present):
+        await mixer.scan()
+        await mixer.scan()
+    assert len(restarts) > failed_attempts, "a fresh reconnect may retry the restore"
+    mixer.restart_streams = restarted
+    restarts.clear()
 
     with patch.object(babel, "discover_audio_devices", return_value=present):
         await mixer.apply("Wireless Microphone", False, "MacBook Pro Speakers")
     assert mixer.microphone == "Wireless Microphone"
-    assert restarts == [True, True]
+    assert restarts == [True]
     assert mixer.panel_seen
 
     class FakeRouter:
@@ -937,6 +1005,82 @@ async def short_sentence_refine_check(temp_dir):
     provisional = [event["id"] for event in DummyUI.events
                    if event.get("provisional")]
     assert provisional == [1], provisional
+
+
+def known_term_check():
+    assert babel.contains_known_term("metamask.", ["MetaMask"])
+    assert not babel.contains_known_term("metamasks metaphoric", ["MetaMask", "Meta"])
+    assert babel.contains_known_term("这里讨论神经元网络。", ["神经元"])
+    assert babel.contains_known_term("Use RGB++.", ["RGB++"])
+    assert not babel.contains_known_term("RGByy.", ["RGB++", "", " "])
+
+
+async def named_short_sentence_check(temp_dir):
+    d19_dir = os.path.join(temp_dir, "d19")
+    os.makedirs(os.path.join(d19_dir, "hotwords"))
+    args = make_args(d19_dir, os.path.join(SOLUTION, "test.wav"))
+    args.no_ui = False
+    args.glossary = os.path.join(d19_dir, "glossary.json")
+    with open(args.glossary, "w", encoding="utf-8") as f:
+        json.dump({"terms": [{"source": name, "target": name}
+                             for name in ["MetaMask", "Neuron", "Raptor"]]}, f)
+    with open(os.path.join(args.hotwords_dir, "names.txt"), "w", encoding="utf-8") as f:
+        f.write("Neko\n")
+    with open(os.path.join(args.hotwords_dir, "high.txt"), "w", encoding="utf-8") as f:
+        f.write("#priority high\n" + "\n".join(f"Critical{i}" for i in range(100)))
+    texts = ["MetaMask.", "Neuron.", "Neko.", "Raptor.", "OK.", "Thank you.", "Hello."]
+    loop = asyncio.get_running_loop()
+    real_loop_time = loop.time
+    offset = [0.0]
+
+    class NamedAsr(DummyAsr):
+        def __init__(self, config):
+            super().__init__(config)
+            assert "Neko" not in config.hotwords, "term protection must survive ASR budget trimming"
+
+        async def transcribe(self, chunks):
+            for index, text in enumerate(texts):
+                # Advance the draft cadence without adding seconds of wall time.
+                offset[0] += 2.1
+                if text != "Hello.":  # No promoted draft must still get a refined pass.
+                    interim = "Okay" if text == "OK." else text.rstrip('.')
+                    yield SimpleNamespace(text=interim, utterances=[], is_last=False)
+                    await asyncio.sleep(0.05)
+                yield SimpleNamespace(text="", utterances=[{
+                    "definite": True, "text": text, "start_time": index * 100,
+                    "end_time": index * 100 + 99,
+                    "additions": {"speaker_id": "0", "lid_lang": "speech_en"},
+                }], is_last=False)
+                await asyncio.sleep(0.01)
+            yield SimpleNamespace(text="", utterances=[], is_last=True)
+
+    class NamedTranslator(DummyTranslator):
+        def __init__(self):
+            self.calls = []
+
+        async def translate(self, text, src, tgt, **kwargs):
+            self.calls.append((text, kwargs))
+            return "这是测试译文。"
+
+    draft, ark = NamedTranslator(), NamedTranslator()
+    with patch.object(babel, "__file__", os.path.join(d19_dir, "main.py")), \
+         patch.object(loop, "time", side_effect=lambda: real_loop_time() + offset[0]), \
+         patch.object(babel, "VolcAsrClient", NamedAsr), \
+         patch.object(babel, "CaptionUI", DummyUI), \
+         patch.object(babel.webbrowser, "open", return_value=True), \
+         patch.object(babel, "build_translator", return_value=draft), \
+         patch.object(babel, "ArkTranslator", return_value=ark):
+        await babel.run(args)
+    assert len(draft.calls) == 6, "all shortcut cases must actually have a draft"
+    assert [text for text, _ in ark.calls] == texts[:4] + ["Hello."], ark.calls
+    jsonl = next(os.path.join(d19_dir, "transcripts", name)
+                 for name in os.listdir(os.path.join(d19_dir, "transcripts"))
+                 if name.endswith(".jsonl") and name != "usage.jsonl")
+    with open(jsonl, encoding="utf-8") as f:
+        records = sorted((json.loads(line) for line in f), key=lambda r: r["seq"])
+    assert [r["translation_outcome"] for r in records] == [
+        "ark", "ark", "ark", "ark", "provisional", "provisional", "ark"
+    ], records
 
 
 async def translate_task_pruning_check():
@@ -1238,6 +1382,8 @@ with tempfile.TemporaryDirectory(prefix="mbabel-p0-") as temp_dir:
         asyncio.run(draft_reset_check(temp_dir))
         asyncio.run(draft_promotion_check(temp_dir))
         asyncio.run(short_sentence_refine_check(temp_dir))
+        known_term_check()
+        asyncio.run(named_short_sentence_check(temp_dir))
         asyncio.run(translate_task_pruning_check())
         asyncio.run(committed_draft_clear_check(temp_dir))
         asyncio.run(context_check(temp_dir))

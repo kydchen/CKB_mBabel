@@ -81,8 +81,11 @@
   #device-btn.warning { color: var(--accent); font-weight: 600; }
   #device-warning {
     display: none; padding: 7px 28px; background: var(--accent); color: var(--paper);
-    font-size: 13px; line-height: 1.4;
+    font-size: 13px; line-height: 1.4; align-items: center; gap: 12px;
   }
+  #device-warning-text { flex: 1; min-width: 0; }
+  #device-dismiss { flex-shrink: 0; }
+  #device-dismiss:focus-visible { outline: 1px solid currentColor; outline-offset: 3px; }
   #candidate-banner {
     display: none; width: 100%; padding: 8px 28px; color: var(--accent);
     background: var(--accent-soft); border: 0; border-bottom: 1px solid var(--hair);
@@ -94,13 +97,14 @@
     display: flex; align-items: center; gap: 12px; padding: 8px 28px;
     background: var(--accent-soft); border-bottom: 1px solid var(--hair);
   }
-  #tunnel-notice, #tunnel-dismiss, #viewer-link {
+  #tunnel-notice, #tunnel-dismiss, #viewer-link, #device-dismiss {
     background: none; border: 0; color: var(--accent); cursor: pointer;
     font: 13px/1.5 var(--sans); text-align: left;
   }
   #tunnel-notice, #viewer-link { flex: 1; }
   #viewer-link { text-decoration: none; }
-  #tunnel-dismiss { padding: 2px 6px; font-size: 20px; }
+  #tunnel-dismiss, #device-dismiss { padding: 2px 6px; font-size: 20px; }
+  #device-dismiss { color: inherit; }
   .link-banner :focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
   @keyframes breathe { 50% { opacity: .35; } }
   body.fs-xl header { display: none; }
@@ -435,7 +439,10 @@
     </button>
   </div>
 </header>
-<div id="device-warning"></div>
+<div id="device-warning">
+  <span id="device-warning-text"></span>
+  <button id="device-dismiss" type="button" aria-label="关闭设备提醒 Dismiss device notice">×</button>
+</div>
 <button id="candidate-banner" type="button"></button>
 <div id="tunnel-banner" class="link-banner" hidden>
   <button id="tunnel-notice" type="button"></button>
@@ -1881,6 +1888,7 @@ function connect() {
     stopLabStats();
     resetVu();
     controlToken = null;
+    renderDeviceWarning();
     document.getElementById('device-btn').style.display = 'none';
     document.getElementById('pair-select').disabled = true;
     pauseBtn.hidden = true;
@@ -1928,6 +1936,7 @@ function handleEvent(ev) {
     }
     else if (ev.type === 'control_token') {
       controlToken = ev.token;
+      renderDeviceWarning();
       document.getElementById('viewer-link-banner').hidden = true;
       if (tunnelNoticePending) showTunnelNotice();
       document.getElementById('device-btn').style.display = '';
@@ -2191,6 +2200,18 @@ const systemToggle = document.getElementById('system-toggle');
 const speakerSelect = document.getElementById('speaker-select');
 const speakerRow = document.getElementById('speaker-row');
 const deviceWarning = document.getElementById('device-warning');
+const deviceWarningText = document.getElementById('device-warning-text');
+let deviceWarningDismissed = false;
+
+function renderDeviceWarning() {
+  const show = !!controlToken && !!deviceWarningText.textContent && !deviceWarningDismissed;
+  deviceBtn.classList.toggle('warning', show);
+  deviceWarning.style.display = show ? 'flex' : 'none';
+}
+document.getElementById('device-dismiss').onclick = () => {
+  deviceWarningDismissed = true;
+  renderDeviceWarning();
+};
 
 function fillSelect(select, values, current) {
   const existing = [...select.options].map(option => option.value);
@@ -2225,9 +2246,10 @@ function onDevices(ev) {
     ? ''
     : '未安装 BlackHole 2ch：brew install blackhole-2ch';
   deviceBtn.textContent = ev.microphone || '无麦克风 No mic';
-  deviceBtn.classList.toggle('warning', !!ev.warning);
-  deviceWarning.textContent = ev.warning || '';
-  deviceWarning.style.display = ev.warning ? 'block' : 'none';
+  const warning = ev.warning || '';
+  if (warning !== deviceWarningText.textContent) deviceWarningDismissed = false;
+  deviceWarningText.textContent = warning;
+  renderDeviceWarning();
   if (ev.first_run && !devicePanelOpened) {
     devicePanelOpened = true;
     openModal('device-mask');

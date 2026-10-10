@@ -449,6 +449,20 @@ def hotword_token_cost(word: str) -> int:
     return max(1, cjk + latin)
 
 
+def contains_known_term(text: str, terms: list[str]) -> bool:
+    folded = text.casefold()
+    for term in terms:
+        term = term.strip()
+        if not term:
+            continue
+        pattern = re.escape(term.casefold())
+        if not CJK_RE.search(term):
+            pattern = rf"(?<!\w){pattern}(?!\w)"
+        if re.search(pattern, folded):
+            return True
+    return False
+
+
 def trim_hotwords(entries: list[tuple[str, int]], limit: int = 100
                   ) -> tuple[list[str], list[str], int]:
     """Keep higher-priority hotwords first without exceeding the token budget."""
@@ -1018,7 +1032,10 @@ class AudioMixer:
                 saved = json.load(f)
         except (OSError, ValueError, TypeError):
             saved = {}
-        self.microphone = saved.get("microphone")
+        self.preferred_microphone = saved.get("microphone")
+        self.microphone = self.preferred_microphone
+        self._preferred_present_scans = 0
+        self._restore_failed = False  # retry only after the device leaves and returns
         self.capture_system = bool(saved.get("capture_system", False))
         self.speaker = saved.get("speaker")
         self.panel_seen = bool(saved.get("panel_seen", False))
@@ -1039,7 +1056,7 @@ class AudioMixer:
 
     def persist(self) -> None:
         data = {
-            "microphone": self.microphone,
+            "microphone": self.preferred_microphone,
             "capture_system": self.capture_system,
             "speaker": self.speaker,
             "panel_seen": self.panel_seen,
@@ -1089,6 +1106,7 @@ class AudioMixer:
         restart = False
         changed = False
         route_changed = False
+        restore_from = None
         if self.microphone not in self.discovery["microphones"]:
             old = self.microphone
             self.microphone = fallback_mic
@@ -1097,6 +1115,23 @@ class AudioMixer:
             if old:
                 self.warning = f"Microphone disappeared: {old}; switched to {fallback_mic or 'none'}"
                 print(f"[audio] {self.warning}", file=sys.stderr)
+        if self.preferred_microphone not in self.discovery["microphones"]:
+            self._restore_failed = False
+        if (self.preferred_microphone in self.discovery["microphones"]
+                and self.microphone != self.preferred_microphone
+                and not self._restore_failed):
+            self._preferred_present_scans += 1
+            # Two consecutive scans reject one-tick reconnect flaps.
+            if self._preferred_present_scans >= 2:
+                restore_from = self.microphone
+                self.microphone = self.preferred_microphone
+                restart = not initial
+                changed = True
+                self._preferred_present_scans = 0
+                self.warning = f"Microphone reconnected: {self.microphone}"
+                print(f"[audio] {self.warning}", file=sys.stderr)
+        else:
+            self._preferred_present_scans = 0
         if self.speaker not in self.discovery["outputs"]:
             if self.speaker != fallback_speaker:
                 old = self.speaker
@@ -1119,7 +1154,19 @@ class AudioMixer:
         if initial or changed:
             self.persist()
         if restart:
-            await self.restart_streams(refresh=True)
+            try:
+                await self.restart_streams(refresh=True)
+            except Exception as e:
+                if not restore_from:
+                    raise
+                self.microphone = restore_from
+                self._preferred_present_scans = 0
+                # An enumerated-but-unopenable device would otherwise be
+                # retried every two polls, glitching the live audio each time.
+                self._restore_failed = True
+                self.warning = f"Cannot reopen {self.preferred_microphone}; kept {restore_from}: {e}"
+                print(f"[audio] {self.warning}", file=sys.stderr)
+                await self.restart_streams(refresh=True)
         if route_changed and not initial:
             self._sync_output_route()
         if notify:
@@ -1130,9 +1177,13 @@ class AudioMixer:
         await self.scan(notify=False)
         restart = False
         route_changed = False
-        if microphone in self.discovery["microphones"] and microphone != self.microphone:
-            self.microphone = microphone
-            restart = True
+        if microphone in self.discovery["microphones"]:
+            self.preferred_microphone = microphone
+            self._preferred_present_scans = 0
+            self._restore_failed = False
+            if microphone != self.microphone:
+                self.microphone = microphone
+                restart = True
         requested_system = bool(capture_system and self.discovery["blackhole"])
         if requested_system != self.capture_system:
             self.capture_system = requested_system
@@ -2383,7 +2434,8 @@ async def _run(args, stamp: str) -> None:
         translation_outcome = "unavailable"
         cache_key = (sentence_pair, text)
         if (sentence_pair == "zh-en" and provisional is not None
-                and hotword_token_cost(text) <= 6):
+                and hotword_token_cost(text) <= 6
+                and not contains_known_term(text, hotwords_all + glossary.hotwords)):
             translated = provisional
             translation_outcome = "provisional"
         elif cache_key in cache and accept_translation(
