@@ -1072,14 +1072,17 @@ async def named_short_sentence_check(temp_dir):
          patch.object(babel, "ArkTranslator", return_value=ark):
         await babel.run(args)
     assert len(draft.calls) == 6, "all shortcut cases must actually have a draft"
-    assert [text for text, _ in ark.calls] == texts[:4] + ["Hello."], ark.calls
+    # "OK." only had a draft of the interim "Okay": a draft of different text
+    # must not become the final translation (2026-10-11 KL chat: "Yeah, I'm
+    # surprised by how accurate." kept the draft "天哪，太亮了").
+    assert [text for text, _ in ark.calls] == texts[:5] + ["Hello."], ark.calls
     jsonl = next(os.path.join(d19_dir, "transcripts", name)
                  for name in os.listdir(os.path.join(d19_dir, "transcripts"))
                  if name.endswith(".jsonl") and name != "usage.jsonl")
     with open(jsonl, encoding="utf-8") as f:
         records = sorted((json.loads(line) for line in f), key=lambda r: r["seq"])
     assert [r["translation_outcome"] for r in records] == [
-        "ark", "ark", "ark", "ark", "provisional", "provisional", "ark"
+        "ark", "ark", "ark", "ark", "ark", "provisional", "ark"
     ], records
 
 
@@ -1350,7 +1353,7 @@ async def reconnect_check(temp_dir):
                if event["type"] == "committed"]
     assert sources == [
         "前一句已经完整落定。",
-        "我们这周讨论一下 fiber 网络和 RGB++的进展，还有基于 UTXO 的状态通道设计。",
+        "我们这周讨论一下 Fiber 网络和 RGB++的进展，还有基于 UTXO 的状态通道设计。",
         "网络恢复后的正常新句子。",
     ], sources
 

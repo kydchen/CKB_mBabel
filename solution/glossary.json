@@ -28,7 +28,6 @@
     "PKBA": "CKBA",
     "Jackie": "Jacky",
     "CC": "CCC",
-    "sell": "cell",
     "kelly": "tally",
     "remoker": "Merkle",
     "GNID": "JoyID",
@@ -57,7 +56,17 @@
     "Golden Walking": "Godwoken",
     "X U D T": "xUDT",
     "S U D T": "sUDT",
-    "S, U, D, T": "sUDT"
+    "S, U, D, T": "sUDT",
+    "CQCON": "CKCon",
+    "光纤网络": "Fiber 网络",
+    "fiber": "Fiber",
+    "country member": "contributing member",
+    "country members": "contributing members",
+    "risk five": "RISC-V",
+    "蜜源": "秘猿",
+    "numbers talk": "Nervos Talk",
+    "nova talk": "Nervos Talk",
+    "CKV": "CKB"
   },
   "terms": [
     {
@@ -93,8 +102,8 @@
       "target": "Fiber Network"
     },
     {
-      "source": "光纤网络",
-      "target": "Fiber Network"
+      "source": "秘猿",
+      "target": "Cryptape"
     },
     {
       "source": "闪电网络",

@@ -37,7 +37,7 @@ from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from asr_client import AsrConfig, AsrError, VolcAsrClient
 from translate import (ARK_TIMEOUT_SECONDS, ArkTranslator, Glossary, build_translator,
-                       translation_rejection_reason)
+                       translation_rejection_reason, _translation_key)
 from ui_server import CaptionUI
 
 
@@ -2390,6 +2390,7 @@ async def _run(args, stamp: str) -> None:
         # W1 draft promotion: a sufficiently complete draft of THIS sentence
         # becomes the ≈ provisional translation until the refined pass lands.
         provisional = None
+        provisional_source = ""
         if sentence_pair != "zh-en":
             try:
                 if vi_fast_translator["engine"] is None:
@@ -2416,6 +2417,7 @@ async def _run(args, stamp: str) -> None:
                     and accept_translation(text, ld["text"], tgt, seg_id,
                                            "provisional", "draft")):
                 provisional = ld["text"]
+                provisional_source = ld.get("source", "")
         if provisional is not None:
             record["translation"] = provisional
             if ui:
@@ -2433,7 +2435,10 @@ async def _run(args, stamp: str) -> None:
         translated = None
         translation_outcome = "unavailable"
         cache_key = (sentence_pair, text)
+        # Keep the draft as final only if it translated this exact text: a
+        # draft of an earlier interim ("Oh my god, so bright") must not stick.
         if (sentence_pair == "zh-en" and provisional is not None
+                and _translation_key(provisional_source) == _translation_key(text)
                 and hotword_token_cost(text) <= 6
                 and not contains_known_term(text, hotwords_all + glossary.hotwords)):
             translated = provisional
