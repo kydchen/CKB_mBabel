@@ -115,6 +115,11 @@
     cursor: pointer; display: none;
   }
   body.fs-xl #pres-exit { display: block; }
+  #pres-hint {
+    flex-shrink: 0; padding: 6px 14px; border-top: 1px solid var(--hair);
+    font: 12px/1.5 var(--sans); color: var(--ink-2); background: var(--strip);
+    text-align: center; cursor: pointer;
+  }
 
   main { flex: 1; overflow-y: auto; scroll-behavior: smooth; position: relative; overscroll-behavior-y: contain; }
   .script { max-width: min(56rem, 94vw); margin: 0 auto; padding: 26px 24px 40px; }
@@ -456,6 +461,7 @@
   <p id="history-note" hidden>更早的字幕请用导出查看 earlier captions are in Export</p>
   <div id="script"></div>
 </div></main>
+<p id="pres-hint" role="status" hidden>点击任意处全屏 Click anywhere for full screen</p>
 <button id="follow-btn">↓ 回到最新 latest</button>
 
 <div class="live">
@@ -1495,9 +1501,12 @@ const SPCOLORS = ['#3D5A80','#5A7247','#A9752F','#7B4B67','#4E616C','#8C5040'];
 // live strip, whatever the font-size preset or viewport width
 const liveEl = document.querySelector('.live');
 function syncStripH() {
-  document.documentElement.style.setProperty('--strip-h', liveEl.offsetHeight + 'px');
+  const hintHeight = document.getElementById('pres-hint').offsetHeight;
+  document.documentElement.style.setProperty('--strip-h', (liveEl.offsetHeight + hintHeight) + 'px');
 }
-new ResizeObserver(syncStripH).observe(liveEl);
+const stripObserver = new ResizeObserver(syncStripH);
+stripObserver.observe(liveEl);
+stripObserver.observe(document.getElementById('pres-hint'));
 syncStripH();
 
 // ---- scroll follow (main scrolls) ----
@@ -1640,6 +1649,19 @@ function applyPair(pair) {
 // ---- prefs: view, font size, theme ----
 const viewSel = document.getElementById('view-sel');
 const fsSel = document.getElementById('fs-sel');
+const presHint = document.getElementById('pres-hint');
+let previousFs = 'm';
+let fullscreenOwner = document.fullscreenElement;
+function syncPresentationHint() {
+  presHint.hidden = fsSel.value !== 'xl' || !document.fullscreenEnabled || !!document.fullscreenElement;
+}
+async function requestPresentationFullscreen() {
+  if (fsSel.value !== 'xl' || !document.fullscreenEnabled
+      || document.fullscreenElement === document.documentElement
+      || document.getElementById('qr-projection')?.hidden === false) return;
+  try { await document.documentElement.requestFullscreen?.(); } catch {}
+  syncPresentationHint();
+}
 function applyTheme(t) {
   document.body.classList.toggle('dark', t === 'dark');
   localStorage.setItem('babel_theme', t);
@@ -1660,17 +1682,42 @@ function applyPrefs() {
   if (v !== 'both') document.body.classList.add('view-' + v);
   if (f !== 'm') document.body.classList.add('fs-' + f);
   document.body.classList.toggle('single', v !== 'both');
-  localStorage.setItem('babel_prefs', JSON.stringify({view: v, fs: f}));
+  if (['s', 'm', 'l'].includes(f)) previousFs = f;
+  localStorage.setItem('babel_prefs', JSON.stringify({view: v, fs: f, previousFs}));
+  if (f !== 'xl' && document.fullscreenElement === document.documentElement) {
+    document.exitFullscreen?.().catch(() => {});
+  }
+  syncPresentationHint();
   renderAll();
 }
 viewSel.onchange = applyPrefs;
-fsSel.onchange = applyPrefs;
+fsSel.onchange = () => { applyPrefs(); requestPresentationFullscreen(); };
 try {
   const p = JSON.parse(localStorage.getItem('babel_prefs') || '{}');
   if (p.view) viewSel.value = p.view;
   if (p.fs) fsSel.value = p.fs;
+  if (['s', 'm', 'l'].includes(p.previousFs)) previousFs = p.previousFs;
 } catch {}
-document.getElementById('pres-exit').onclick = () => { fsSel.value = 'm'; applyPrefs(); };
+function exitPresentation() { fsSel.value = previousFs; applyPrefs(); }
+document.getElementById('pres-exit').onclick = exitPresentation;
+document.addEventListener('fullscreenchange', () => {
+  const exited = fullscreenOwner === document.documentElement && !document.fullscreenElement;
+  fullscreenOwner = document.fullscreenElement;
+  if (document.fullscreenElement === document.documentElement && fsSel.value !== 'xl') applyPrefs();
+  // Closing the QR overlay must not shrink the subtitle presentation beneath it.
+  if (exited && fsSel.value === 'xl' && document.getElementById('qr-projection')?.hidden !== false) exitPresentation();
+  syncPresentationHint();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !e.defaultPrevented && fsSel.value === 'xl' && !document.fullscreenElement
+      && document.getElementById('qr-projection')?.hidden !== false) exitPresentation();
+});
+document.addEventListener('click', e => {
+  if (!presHint.hidden && !e.target.closest('button, a, input, select, textarea, label, [contenteditable], [role="button"], [role="link"]')) {
+    requestPresentationFullscreen();
+  }
+});
+applyPrefs();
 
 // ---- sentence rendering ----
 function transTextFor(ev) {
@@ -2089,7 +2136,10 @@ function closeProjection() {
   document.getElementById('qr-projection-code').textContent = '';
   document.getElementById('qr-projection-url').textContent = '';
   projectedKey = null;
-  if (document.fullscreenElement === qrProjection) document.exitFullscreen().catch(() => {});
+  if (document.fullscreenElement === qrProjection) {
+    fullscreenOwner = qrProjection;  // Its fullscreenchange event may still be queued.
+    document.exitFullscreen().catch(() => {}).then(requestPresentationFullscreen);
+  } else requestPresentationFullscreen();
   if (projectionTrigger?.isConnected) projectionTrigger.focus();
 }
 function renderProjection() {
