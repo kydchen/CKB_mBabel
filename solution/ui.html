@@ -122,13 +122,10 @@
   }
 
   main { flex: 1; overflow-y: auto; scroll-behavior: smooth; position: relative; overscroll-behavior-y: contain; }
-  /* Scrollbar: a hairline thumb on no track, quiet in both themes; hidden in
-     the presentation size, where captions auto-follow. */
+  /* Scrollbar: a hairline thumb on no track, quiet in both themes. */
   main { scrollbar-width: thin; scrollbar-color: var(--hair) transparent; }
   main::-webkit-scrollbar { width: 6px; background: transparent; }
   main::-webkit-scrollbar-thumb { background: var(--hair); border-radius: 3px; }
-  body.fs-xl main { scrollbar-width: none; }
-  body.fs-xl main::-webkit-scrollbar { display: none; }
   .script { max-width: min(56rem, 94vw); margin: 0 auto; padding: 26px 24px 40px; }
   #history-note { color: var(--ink-3); font-size: 12.5px; line-height: 1.5; margin: 0 0 16px; }
   body.fs-xl .script { max-width: min(80rem, 94vw); }
