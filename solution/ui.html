@@ -313,7 +313,7 @@
   #qr-projection:fullscreen { background: #fff; }
   #qr-projection canvas { display: block; width: min(78vw, 72vh); height: auto; image-rendering: pixelated; }
   #qr-projection-url { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #qr-projection-scope { font-size: 13px; color: #555; }
+  #qr-projection-scope, #qr-projection-note { font-size: 13px; color: #555; }
   .modal .k { color: var(--accent); font-weight: 600; }
   .modal .close { float: right; cursor: pointer; color: var(--ink-3); font-size: 20px; }
   /* one language at a time inside dialogs; the flip button switches */
@@ -625,6 +625,7 @@
   <span id="qr-projection-code"></span>
   <span id="qr-projection-url"></span>
   <span id="qr-projection-scope"></span>
+  <span id="qr-projection-note">不会被搜索引擎收录 · Not indexed by search engines</span>
 </button>
 
 <div class="modal-mask" id="candidates-mask" role="dialog" aria-modal="true" aria-labelledby="candidates-title">

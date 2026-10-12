@@ -37,6 +37,11 @@ async def replay_check():
     await ui.emit({"type": "translation", "id": 2701, "text": "retained refinement"})
     await ui.start()
     port = ui.server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"GET /offline-d17 HTTP/1.1\r\nHost: test\r\n\r\n")
+    head = (await reader.readuntil(b"\r\n\r\n")).decode().lower()
+    writer.close()
+    assert "x-robots-tag: noindex" in head, head
     destination = f"ws://127.0.0.1:{port}/offline-d17"
     active_relays = set()
 

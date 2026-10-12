@@ -75,6 +75,9 @@ class CaptionUI:
                     Headers({
                         "Content-Type": "text/html; charset=utf-8",
                         "Cache-Control": "no-store",  # never serve a stale UI
+                        # Share links carry private meetings: keep them out of
+                        # search indexes and caches even if a link is posted.
+                        "X-Robots-Tag": "noindex, nofollow, noarchive",
                     }),
                     html,
                 )
