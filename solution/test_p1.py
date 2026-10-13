@@ -48,6 +48,8 @@ assert _render_context(context) == (
 )
 assert _looks_like_reasoning("The answer.\nExtra explanation.")
 assert not _looks_like_reasoning("The state rent remains unchanged.")
+assert _looks_like_reasoning('等等，不对，用户现在需要翻译的是最后那句英文："alike and so forth."')
+assert not _looks_like_reasoning("我们需要改进用户体验，不对的地方欢迎指出。")
 
 identity = {"CKB", "CKCON", "RGB++", "Matt Quinn"}
 assert translation_rejection_reason("Test, test.", "Test, test.", "zh", identity) == "same_as_source"

@@ -164,7 +164,10 @@ class VolcMtTranslator:
 # appear in a zh translation (observed once: mini deliberating in output)
 _LEAK_MARKERS = ("Wait,", "wait no", "source text", "target language",
                  "the user's", "Let's translate", "let's translate",
-                 "looking again")
+                 "looking again",
+                 # zh self-talk shown at CKCON 2026-10-13: "等等，不对，用户现在
+                 # 需要翻译的是最后那句英文：..."
+                 "不对，", "用户现在", "需要翻译", "句英文", "段英文")
 
 
 def _looks_like_reasoning(out: str) -> bool:
