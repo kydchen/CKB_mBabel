@@ -123,9 +123,15 @@ A browser window opens with the caption page. Useful flags:
 - `--wav test.wav` — replay a 16kHz mono WAV instead of the mic (a sample is included).
 - `--no-ui` — terminal-only output.
 
+In **Share/Export**, the local host can enable **Private** for the current run. This stops the public tunnel, keeps local/LAN access, and reconnects viewers without history replay. The QR switches to the LAN address (same Wi-Fi). Turning Private off restores normal sharing, including the latest 300 captions on viewer (re)connect. **Reset link** replaces the token and disconnects viewers; old links return 404, while the host page, audio session, and transcript stay active. Redistribute the new link/QR. The public tunnel is recreated, so its hostname may also change and take a moment to appear.
+
+These controls limit distribution, not cloud processing or previously saved copies. ASR and translation still use cloud services; anyone with a valid LAN link on the network can join. Already received/exported captions cannot be recalled. Private mode is not remembered after restarting the app.
+
 Double-click `mBabel.app` (after the optional install above) or `Babel.command`. The host-only microphone chip opens the device panel; settings persist outside the synced repository in `~/.mbabel/audio_config.json`.
 
 ## Domain adaptation
+
+Translation checks stay strict about copied source text. Numeric output is accepted without target-language letters only if the source is itself numeric, including Chinese numerals. If every translation channel fails content checks, a short Latin-script source (up to three words) may be kept on screen as a last resort, rather than marked as a translation failure. This display-only fallback does not replace a usable draft or a successful translation, and is recorded as `source_kept` in the transcript.
 
 - `hotwords/hotwords.txt`, `hotwords/hotwords_zh.txt` — ASR hotwords, one per line. `#priority high|normal|low` starts a priority section; low-priority terms are trimmed first at the 100-token direct cap. English proper nouns also become identity terms in the translation glossary (kept as-is).
 - `solution/glossary.json` — `terms`: zh↔en pairs for translation enforcement (values should be mixed forms like "Fiber网络" for en→zh; matching is case-sensitive, variants are generated). `corrections`: ASR mishearing fixes applied before display and translation.

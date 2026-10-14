@@ -178,6 +178,11 @@ def _looks_like_reasoning(out: str) -> bool:
 _CJK_TEXT_RE = re.compile(r"[\u3400-\u9fff]")
 _LATIN_TEXT_RE = re.compile(r"[A-Za-z]")
 _IDENTITY_TOKEN_RE = re.compile(r"[A-Za-z]+|\d+")
+_CHINESE_NUMBER_CHARS = frozenset("〇零一二三四五六七八九十百千万亿两点")
+CONTENT_REJECTIONS = frozenset({
+    "same_as_source", "missing_target_zh", "missing_target_en",
+    "missing_target_vi", "excessive_length",
+})
 
 
 def _translation_key(text: str) -> str:
@@ -209,6 +214,15 @@ def _identity_only(source: str, identity_terms: set[str] | frozenset[str]) -> bo
     )
 
 
+def short_latin_source(source: str) -> bool:
+    """Eligibility for display-only fallback, never translation validation."""
+    words = re.findall(r"[^\W\d_]+", unicodedata.normalize("NFKC", source))
+    return 1 <= len(words) <= 3 and all(
+        unicodedata.name(char, "").startswith("LATIN ")
+        for word in words for char in word
+    )
+
+
 def translation_rejection_reason(
     source: str,
     output: str,
@@ -233,6 +247,15 @@ def translation_rejection_reason(
     if len(output_key) > max(80, len(source_key) * 8):
         return "excessive_length"
     if unchanged_identity:
+        return None
+    numeric_source = bool(source_key) and all(
+        char.isdecimal() or char in _CHINESE_NUMBER_CHARS for char in source_key
+    )
+    numeric_output = output_key.isdecimal() and all(
+        char.isdecimal() or char.isspace() or unicodedata.category(char).startswith("P")
+        for char in unicodedata.normalize("NFKC", output)
+    )
+    if numeric_source and numeric_output and target_lang in ("zh", "en", "vi"):
         return None
     if target_lang == "zh" and not _CJK_TEXT_RE.search(output):
         return "missing_target_zh"

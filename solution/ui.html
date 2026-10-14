@@ -592,8 +592,18 @@
       <p class="zh">打开链接的人能看到实时双语字幕，也可以在自己浏览器里导出。链接在程序关闭后失效。</p>
       <p class="en">Anyone with the link can watch live bilingual captions and export from their own browser. Links expire when the app stops.</p>
       <div id="share-links"></div>
-      <p class="zh" style="color:var(--ink-3);font-size:13px">拿到公网链接的人即可看到会议字幕全文，请只发给与会者。</p>
-      <p class="en" style="color:var(--ink-3);font-size:13px">The public link exposes the full transcript. Share only with attendees.</p>
+      <div id="sharing-controls" hidden>
+        <div class="lab-row">
+          <input type="checkbox" id="private-toggle">
+          <label for="private-toggle" style="margin:0">私密会话 Private</label>
+        </div>
+        <p class="device-help zh">关闭公网分享，只允许同一 Wi-Fi；观众重新连接后只接收新字幕。已收到或导出的内容无法收回。</p>
+        <p class="device-help en">Disable public sharing; same Wi-Fi only. Reconnecting viewers receive new captions only. Already received or exported content cannot be recalled.</p>
+        <button class="hbtn" id="reset-link" type="button">重置链接 Reset link</button>
+        <p id="sharing-error" class="device-help" role="status"></p>
+      </div>
+      <p class="zh" style="color:var(--ink-3);font-size:13px">只把链接发给与会者。默认回放最近 300 句，私密会话不向观众回放历史。语音识别与翻译仍使用云端服务。</p>
+      <p class="en" style="color:var(--ink-3);font-size:13px">Share only with attendees. Viewers normally receive the latest 300 captions; Private mode has no history replay. Speech recognition and translation still use cloud services.</p>
     </div>
     <h3>导出 Export</h3>
     <p id="export-scope" hidden style="color:var(--ink-3);font-size:13px"><span class="zh">本页导出从加入时最近 300 句起，完整记录由主持人保存</span><span class="en">Export covers the last 300 captions before you joined; the host keeps the full record</span></p>
@@ -1935,16 +1945,26 @@ function connect() {
   const ws = new WebSocket(proto + location.host + location.pathname);
   wsConn = ws;
   ws.onopen = () => setLive('');
-  ws.onclose = () => {
+  ws.onclose = event => {
     if (replaying) { replaying = false; renderAll(); }
     stopLabStats();
     resetVu();
     controlToken = null;
+    document.getElementById('sharing-controls').hidden = true;
     renderDeviceWarning();
     document.getElementById('device-btn').style.display = 'none';
     document.getElementById('pair-select').disabled = true;
     pauseBtn.hidden = true;
     endBtn.hidden = true;
+    if (event.code === 4001) {
+      setLive('链接失效 Link reset');
+      const link = document.getElementById('viewer-link');
+      link.removeAttribute('href');
+      link.textContent = '链接已重置，请向主持人索取新链接 Link reset; ask the host for a new link';
+      link.style.cursor = 'default';
+      document.getElementById('viewer-link-banner').hidden = false;
+      return;
+    }
     if (sessionEnded) {  // deliberate end: keep the page for export, no retries
       setLive('ended');
       return;
@@ -1956,7 +1976,18 @@ function connect() {
 }
 function handleEvent(ev) {
     if (ev.type === 'replay') {
-      document.getElementById('export-scope').hidden = !ev.truncated;
+      const scope = document.getElementById('export-scope');
+      scope.hidden = !ev.truncated && !ev.live_only;
+      scope.textContent = ev.live_only
+        ? '私密会话：仅导出本次连接后收到的字幕 Private: captions received since this connection only'
+        : '本页导出从加入时最近 300 句起，完整记录由主持人保存 Export starts with the latest 300 captions; the host keeps the full record';
+      if (ev.live_only) {
+        history.length = 0;
+        seenIds.clear();
+        for (const id of Object.keys(transById)) delete transById[id];
+        hearing.textContent = '';
+        clearDraft();
+      }
       for (const event of ev.events) handleEvent(event);
       return;
     }
@@ -1980,6 +2011,16 @@ function handleEvent(ev) {
     else if (ev.type === 'translation') addTranslation(ev);
     else if (ev.type === 'pair_state') applyPair(ev.pair);
     else if (ev.type === 'share') onShare(ev);
+    else if (ev.type === 'sharing_state') {
+      if (!controlToken) return;
+      document.getElementById('sharing-controls').hidden = false;
+      privateToggle.checked = !!ev.private;
+      privateToggle.disabled = resetLink.disabled = false;
+      document.getElementById('sharing-error').textContent = ev.error || '';
+      if (typeof ev.path === 'string' && /^\/[A-Za-z0-9_-]*$/.test(ev.path)) {
+        window.history.replaceState(null, '', ev.path);
+      }
+    }
     else if (ev.type === 'tunnel_state') {
       tunnelNoticeText = ev.text || '';
       tunnelNoticeSeen = true;
@@ -2002,6 +2043,7 @@ function handleEvent(ev) {
       wsSend({type: 'candidates_get'});
       wsSend({type: 'ark_tier_get'});
       wsSend({type: 'pair_get'});
+      wsSend({type: 'sharing_get'});
     }
     else if (ev.type === 'devices') onDevices(ev);
     else if (ev.type === 'pause_state') {
@@ -2087,6 +2129,18 @@ document.getElementById('info-btn').onclick = () => openModal('info-mask');
 
 // ---- share ----
 let shareInfo = {};
+let privateSession = false;
+const privateToggle = document.getElementById('private-toggle');
+const resetLink = document.getElementById('reset-link');
+privateToggle.onchange = () => {
+  privateToggle.disabled = resetLink.disabled = true;
+  wsSend({type: 'private', enabled: privateToggle.checked});
+};
+resetLink.onclick = () => {
+  if (!confirm('旧观众会断开，需要新链接重新加入。重置链接？\nDisconnect viewers and invalidate the old link. Reset link?')) return;
+  privateToggle.disabled = resetLink.disabled = true;
+  wsSend({type: 'reset_link'});
+};
 let publicLinkSeen = false;
 let tunnelNoticeSeen = false;
 let tunnelNoticePending = false;
@@ -2107,8 +2161,11 @@ function onShare(ev) {
   const previous = shareInfo.public;
   // Only published URLs, never host controls or the Lab token.
   shareInfo = {public: shareURL(ev.public), lan: shareURL(ev.lan)};
+  privateSession = !!ev.private;
+  if (privateSession && projectedKey === 'public') projectedKey = 'lan';
   renderShareLinks();
-  if (controlToken && previous !== shareInfo.public && (publicLinkSeen || tunnelNoticeSeen)) showTunnelNotice();
+  if (controlToken && !privateSession && previous !== shareInfo.public && (publicLinkSeen || tunnelNoticeSeen)) showTunnelNotice();
+  if (privateSession) tunnelBanner.hidden = true;
   if (shareInfo.public) publicLinkSeen = true;
   updateViewerLink();
 }
@@ -2157,7 +2214,8 @@ function renderProjection() {
   document.getElementById('qr-projection-code').replaceChildren(enlarged);
   document.getElementById('qr-projection-url').textContent = url.replace(/^https?:\/\//, '');
   document.getElementById('qr-projection-scope').textContent = projectedKey === 'lan'
-    ? '同一 Wi-Fi 可用 Same Wi-Fi only' : 'mBabel · 扫码看字幕 Scan for captions';
+    ? (privateSession ? '私密会话 · 仅同一 Wi-Fi Private · Same Wi-Fi only'
+      : '同一 Wi-Fi 可用 Same Wi-Fi only') : 'mBabel · 扫码看字幕 Scan for captions';
 }
 function openProjection(key, trigger) {
   if (!qrCanvases[key]) return;
@@ -2193,13 +2251,16 @@ function renderShareLinks() {
   qrCanvases = {};
   if (!shareInfo.public) {
     const pending = document.createElement('p');
-    pending.textContent = '公网链接不可用 Public link unavailable';
+    pending.textContent = privateSession
+      ? '私密会话 · 仅同一 Wi-Fi Private · Same Wi-Fi only'
+      : '公网链接不可用 Public link unavailable';
     pending.style.color = 'var(--ink-3)';
     box.appendChild(pending);
   }
   for (const [key, label] of [['public', '公网 Public'], ['lan', '局域网 LAN · 同一 Wi-Fi 可用 Same Wi-Fi only']]) {
     if (!shareInfo[key]) continue;
     const section = document.createElement(key === 'lan' ? 'details' : 'div');
+    if (key === 'lan' && privateSession) section.open = true;
     section.className = 'share-qr' + (key === 'lan' ? ' lan-qr' : '');
     section.dataset.key = key;
     const lab = document.createElement(key === 'lan' ? 'summary' : 'div');

@@ -40,7 +40,7 @@ class D5FallbackTranslator(DummyTranslator):
         if text == "需要补译。":
             type(self).backfill_calls += 1
             if self.backfill_calls == 1:
-                return text  # invalid initial fallback
+                raise ConnectionError("offline fallback transport failure")
             return "This needs backfilling."
         return "这是后备译文。" if tgt == "zh" else "This is the fallback."
 

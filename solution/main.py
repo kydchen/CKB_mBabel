@@ -29,14 +29,17 @@ import wave
 import webbrowser
 from collections import Counter, deque
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+from openai import APIConnectionError
 
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from asr_client import AsrConfig, AsrError, VolcAsrClient
-from translate import (ARK_TIMEOUT_SECONDS, ArkTranslator, Glossary, build_translator,
+from translate import (ARK_TIMEOUT_SECONDS, CONTENT_REJECTIONS, ArkTranslator, Glossary,
+                       build_translator, short_latin_source,
                        translation_rejection_reason, _translation_key)
 from ui_server import CaptionUI
 
@@ -105,6 +108,23 @@ TUNNEL_PROBE_TIMEOUT = 10.0
 TUNNEL_GRACE_SECONDS = 90.0
 TUNNEL_RESTART_LIMIT = 3
 TUNNEL_RESTART_WINDOW = 3600.0
+HOTWORD_RUN_MIN_TERMS = 4
+HOTWORD_RUN_REMAINDER_RATIO = 0.25
+
+
+def is_hotword_run(text: str, terms: list[str]) -> bool:
+    """Catch glossary lists, including ASR runs with no word separators."""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    words = {unicodedata.normalize("NFKC", word).strip().casefold()
+             for word in terms if word.strip()}
+    if not text or not words:
+        return False
+    pattern = re.compile("|".join(re.escape(word)
+                                  for word in sorted(words, key=lambda w: (-len(w), w))))
+    hits = {match.group() for match in pattern.finditer(text)}
+    remaining = sum(char.isalnum() for char in pattern.sub("", text))
+    return (len(hits) >= HOTWORD_RUN_MIN_TERMS
+            and remaining <= len(text) * HOTWORD_RUN_REMAINDER_RATIO)
 
 
 class LogTee:
@@ -1411,6 +1431,58 @@ def _atomic_write_text(path: str, text: str) -> None:
             pass
 
 
+def transcript_markdown(records: list[dict], stamp: str) -> str:
+    records = sorted(records, key=lambda record: record["seq"])
+    pairs = list(dict.fromkeys(record.get("pair", "zh-en") for record in records))
+    label = pairs[0] if len(pairs) == 1 else f"mixed ({', '.join(pairs)})"
+    lines = [f"# Babel transcript {stamp}\n\nPair: {label}\n\n"]
+    for record in records:
+        speaker = record.get("speaker")
+        who = (f"Speaker {int(speaker) + 1}"
+               if speaker is not None and str(speaker).isdigit() else speaker or "")
+        lines.append(f"**{who}** ({record['lang']}) [{record.get('time', '')}]: "
+                     f"{record['source']}\n\n> {record.get('translation', '')}\n\n")
+    return "".join(lines)
+
+
+def rebuild_missing_markdown(directory: str, current_path: str) -> None:
+    """Recover completed JSONL rows after a crash; never overwrite an existing MD."""
+    for source in sorted(Path(directory).glob("babel-*.jsonl")):
+        target = source.with_suffix(".md")
+        if source == Path(current_path) or target.exists():
+            continue
+        try:
+            before = source.stat()
+            records, backfills = {}, {}
+            with source.open("rb") as stream:
+                for number, line in enumerate(stream, 1):
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        # A killed writer may leave an incomplete final row.
+                        print_safe(f"[transcript] skipped incomplete row {source.name}:{number}",
+                                   file=sys.stderr)
+                        continue
+                    if not isinstance(record, dict) or not isinstance(record.get("seq"), int):
+                        continue
+                    if "backfill" in record:
+                        backfills[record["seq"]] = record["backfill"]
+                    elif isinstance(record.get("source"), str) and record.get("lang"):
+                        records[record["seq"]] = record
+            after = source.stat()
+            if (not records or target.exists()
+                    or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)):
+                continue
+            for seq, translation in backfills.items():
+                if seq in records:
+                    records[seq]["translation"] = translation
+            _atomic_write_text(str(target), transcript_markdown(
+                list(records.values()), source.stem.removeprefix("babel-")))
+            print_safe(f"[transcript] rebuilt {target}")
+        except (OSError, UnicodeError) as error:
+            print_safe(f"[transcript] cannot rebuild {source.name}: {error}", file=sys.stderr)
+
+
 def atomic_merge_glossary(path: str, corrections: dict | None = None,
                           terms: list[dict] | None = None) -> None:
     with open(path, encoding="utf-8") as f:
@@ -1754,6 +1826,86 @@ async def probe_public_url(url: str) -> tuple[bool, str]:
         return False, " ".join(f"{type(error).__name__}: {error}".split())[:200]
 
 
+class SharingSession:
+    """Own tunnel lifetime; privacy/link controls leave the audio session alone."""
+
+    def __init__(self, ui: CaptionUI, enabled: bool, lan_base: str):
+        self.ui, self.enabled, self.lan_base = ui, enabled, lan_base
+        self.task: asyncio.Task | None = None
+        self.lock = asyncio.Lock()
+        self.closed = False
+
+    async def close(self) -> None:
+        async with self.lock:
+            self.closed = True
+            await self._stop_tunnel()
+
+    async def _stop_tunnel(self) -> None:
+        if self.task:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+            self.task = None
+
+    async def start(self) -> None:
+        suffix = f"/{self.ui.token}" if self.ui.token else ""
+        lan = self.lan_base + suffix if self.enabled else None
+        await self.ui.set_share(lan, None)
+        if self.enabled and not self.ui.private:
+            self.task = asyncio.create_task(maintain_tunnel(self.ui.port, self.ui, lan, suffix))
+
+    async def state(self, error: str = "") -> None:
+        await self.ui.emit_control({
+            "type": "sharing_state", "private": self.ui.private,
+            "path": f"/{self.ui.token}" if self.ui.token else "/",
+            "error": error,
+        })
+
+    async def control(self, msg: dict) -> None:
+        async with self.lock:
+            if self.closed:
+                return
+            try:
+                if msg["type"] == "private":
+                    enabled = msg.get("enabled")
+                    if not isinstance(enabled, bool):
+                        return
+                    if self.ui.private != enabled:
+                        # Stop new history snapshots immediately, before waiting
+                        # for cloudflared cleanup; set_share also hides public URLs.
+                        await self.ui.set_private(enabled)
+                        await self._stop_tunnel()
+                        await self.start()
+                elif msg["type"] == "reset_link":
+                    token = secrets.token_urlsafe(6)
+                    # If the session-file write fails, keep the old live route.
+                    register_session(self.ui.port, f"http://127.0.0.1:{self.ui.port}/{token}")
+                    await self.ui.reset_link(token)
+                    await self._stop_tunnel()
+                    await self.start()
+                await self.state()
+            except OSError as error:
+                print_safe(f"[share] cannot update sharing: {error}", file=sys.stderr)
+                await self.state("分享设置未完成，请重试 / Sharing change failed; retry")
+
+
+def retryable_translation_error(error: Exception) -> bool:
+    """Backfill transient failures: transport, timeouts, throttling and 5xx,
+    including SDK-wrapped HTTPX errors. Auth and request errors stay final."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, (ConnectionError, TimeoutError, httpx.TransportError, APIConnectionError)):
+            return True
+        if type(error).__name__ == "RateLimitError":  # volc-mt and openai SDK alike
+            return True
+        status = (getattr(error, "status_code", None)
+                  or getattr(getattr(error, "response", None), "status_code", None))
+        if isinstance(status, int) and status >= 500:
+            return True
+        error = error.__cause__
+    return False
+
+
 async def run(args) -> None:
     if not args.no_ui and reopen_existing_session(args.port):
         return
@@ -1763,6 +1915,8 @@ async def run(args) -> None:
     stamp = time.strftime("%Y%m%d-%H%M")
     with session_log(os.path.join(transcript_dir, f"babel-{stamp}.log")) as log:
         try:
+            rebuild_missing_markdown(transcript_dir,
+                                     os.path.join(transcript_dir, f"babel-{stamp}.jsonl"))
             await _run(args, stamp)
         except SystemExit as error:
             print_safe(str(error), file=log)  # The CLI prints it once on exit.
@@ -1918,7 +2072,7 @@ async def _run(args, stamp: str) -> None:
     }
 
     ui: CaptionUI | None = None
-    share_task: asyncio.Task | None = None
+    sharing: SharingSession | None = None
     session_registered = False
     if not args.no_ui:
         # with --share the page is served only under a random token path
@@ -1950,13 +2104,10 @@ async def _run(args, stamp: str) -> None:
         print(f"[control] Lab token: {ui.control_token} "
               f"(the local page receives it automatically; never shared)")
         if args.share:
-            lan_url = f"http://{lan_ip()}:{ui.port}{suffix}"
-            print(f"[share] LAN link: {lan_url}")
-            await ui.set_share(lan_url, None)
-
-            share_task = asyncio.create_task(
-                maintain_tunnel(ui.port, ui, lan_url, suffix)
-            )  # Tunnel setup never blocks audio / ASR startup.
+            lan_base = f"http://{lan_ip()}:{ui.port}"
+            print(f"[share] LAN link: {lan_base}{suffix}")
+            sharing = SharingSession(ui, True, lan_base)
+            await sharing.start()  # Tunnel setup never blocks audio / ASR startup.
         try:
             webbrowser.open(url)
         except OSError as e:
@@ -2043,7 +2194,10 @@ async def _run(args, stamp: str) -> None:
     async def on_control(msg: dict) -> None:
         """Control messages from the UI (token-guarded in ui_server)."""
         kind = msg.get("type")
-        if kind == "correction":
+        if (kind in ("sharing_get", "private", "reset_link")
+                and sharing and not cleanup_started["v"]):
+            await sharing.control(msg)
+        elif kind == "correction":
             wrong = (msg.get("wrong") or "").strip()
             right = (msg.get("right") or "").strip()
             if wrong and right and wrong.lower() != right.lower():
@@ -2277,11 +2431,14 @@ async def _run(args, stamp: str) -> None:
         return "ark" if engine is ark_polisher else args.translator
 
     def accept_translation(source: str, output: str, target: str, seg_id: int,
-                           stage: str, engine: str) -> bool:
+                           stage: str, engine: str,
+                           failures: list[str] | None = None) -> bool:
         reason = translation_rejection_reason(
             source, output, target, identity_terms
         )
         if reason:
+            if failures is not None:
+                failures.append(reason)
             print(f"[translate] rejected seq={seg_id} stage={stage} "
                   f"engine={engine} reason={reason}", file=sys.stderr)
             return False
@@ -2289,7 +2446,8 @@ async def _run(args, stamp: str) -> None:
 
     async def request_refined(engine, text: str, src: str, tgt: str,
                               context: list[dict] | None, seg_id: int,
-                              stage: str, retries: int = 3) -> str | None:
+                              stage: str, retries: int = 3,
+                              failures: list[str] | None = None) -> str | None:
         """Call one backend and return only an accepted target-language result."""
         started = time.monotonic()
         waits = [1, 3]
@@ -2318,10 +2476,13 @@ async def _run(args, stamp: str) -> None:
                     waits = [5, 15]
                 print(f"[translate] attempt {attempt + 1} failed: {e} "
                       f"(totals: {fail_stats})", file=sys.stderr)
+                if failures is not None:
+                    failures.append("network_error" if retryable_translation_error(e)
+                                    else "backend_error")
                 continue
             if request_meta.get("tier_fallback"):
                 await emit_ark_tier_state()
-            if accept_translation(text, output, tgt, seg_id, stage, label):
+            if accept_translation(text, output, tgt, seg_id, stage, label, failures):
                 latency_ms = max(1, round((time.monotonic() - started) * 1000))
                 tier = request_meta.get("service_tier", ark_tier())
                 refined_meta[seg_id] = {
@@ -2340,7 +2501,8 @@ async def _run(args, stamp: str) -> None:
         newer than what is on screen is shown, even if a newer one is
         already in flight; this keeps the draft cadence at translation
         speed instead of collapsing to sentence end."""
-        if session_pair["value"] != "zh-en":
+        if (session_pair["value"] != "zh-en"
+                or is_hotword_run(text, hotwords_all + glossary.hotwords)):
             return
         try:
             src, tgt = detect_direction(text)
@@ -2365,6 +2527,9 @@ async def _run(args, stamp: str) -> None:
                      sentence_pair: str = "zh-en",
                      detected_lang: str | None = None,
                      trace: dict | None = None) -> None:
+        if is_hotword_run(text, hotwords_all + glossary.hotwords):
+            print(f"[asr] dropped hotword run: {text}", file=sys.stderr)
+            return
         src, tgt, detected, lang_source = resolve_direction(
             text, sentence_pair, detected_lang
         )
@@ -2451,36 +2616,47 @@ async def _run(args, stamp: str) -> None:
         else:
             cache.pop(cache_key, None)  # never retain a pre-gate or corrupted value
             engine = ark_polisher if ark_polisher is not None else translator
+            failures = []
             translated = await request_refined(
-                engine, text, src, tgt, ctx, seg_id, "final"
+                engine, text, src, tgt, ctx, seg_id, "final", failures=failures
             )
             if translated is not None:
                 translation_outcome = engine_label(engine)
             elif engine is ark_polisher:
                 translated = await request_refined(
-                    engine, text, src, tgt, None, seg_id, "ark_no_context", 1
+                    engine, text, src, tgt, None, seg_id, "ark_no_context", 1, failures
                 )
                 if translated is not None:
                     translation_outcome = "ark_no_context"
                 elif translator is not engine:
                     translated = await request_refined(
                         translator, text, src, tgt, None, seg_id,
-                        "fallback", 1
+                        "fallback", 1, failures
                     )
                     if translated is not None:
                         translation_outcome = f"{engine_label(translator)}_fallback"
             if translated is None:
-                # both engines failed: the provisional draft is still a
-                # readable line; schedule quiet backfills
+                # Preserve a usable draft, but only transport failures warrant
+                # background retries. Repeating rejected content cannot help.
+                retry_network = "network_error" in failures
                 translated = provisional or "⚠ 翻译失败 translation unavailable"
                 translation_outcome = (
-                    "provisional_pending" if provisional else "unavailable"
+                    ("provisional_pending" if retry_network else "provisional")
+                    if provisional else "unavailable"
                 )
-                translate_tasks.append(
-                    asyncio.create_task(
-                        backfill(text, seg_id, src, tgt, ctx, context_entry)
+                if (provisional is None and failures
+                        and all(reason in CONTENT_REJECTIONS for reason in failures)
+                        and short_latin_source(text)):
+                    # Display only: keep validation strict and do not cache this
+                    # as a successful translation or bypass a valid draft.
+                    translated = text
+                    translation_outcome = "source_kept"
+                if retry_network:
+                    translate_tasks.append(
+                        asyncio.create_task(
+                            backfill(text, seg_id, src, tgt, ctx, context_entry)
+                        )
                     )
-                )
             else:
                 cache[cache_key] = translated  # never cache the failure placeholder
         if not translated.startswith("⚠ "):
@@ -2509,23 +2685,26 @@ async def _run(args, stamp: str) -> None:
         engine = ark_polisher if ark_polisher is not None else translator
         for _ in range(12):
             await asyncio.sleep(15)
+            failures = []
             outcome = f"{engine_label(engine)}_backfill"
             fixed = await request_refined(
-                engine, text, src, tgt, ctx, seg_id, "backfill", 1
+                engine, text, src, tgt, ctx, seg_id, "backfill", 1, failures
             )
             if fixed is None and engine is ark_polisher:
                 fixed = await request_refined(
                     engine, text, src, tgt, None, seg_id,
-                    "backfill_no_context", 1
+                    "backfill_no_context", 1, failures
                 )
                 outcome = "ark_no_context_backfill"
                 if fixed is None and translator is not engine:
                     fixed = await request_refined(
                         translator, text, src, tgt, None, seg_id,
-                        "backfill_fallback", 1
+                        "backfill_fallback", 1, failures
                     )
                     outcome = f"{engine_label(translator)}_fallback_backfill"
             if fixed is None:
+                if "network_error" not in failures:
+                    return
                 continue
             sentence_pair = context_entry.get("pair", session_pair["value"])
             cache[(sentence_pair, text)] = fixed
@@ -2656,6 +2835,7 @@ async def _run(args, stamp: str) -> None:
                         reconnects = 0
                         last_activity["t"] = asyncio.get_running_loop().time()
                     packet_seg_seq = seg_seq
+                    packet_dropped = False
                     for utt in event.utterances:
                         key = (utt.get("start_time", 0), utt.get("end_time", 0),
                                (utt.get("text") or "")[:16])
@@ -2663,6 +2843,18 @@ async def _run(args, stamp: str) -> None:
                             committed.add(key)
                             frag_trace = traced(utt["text"])
                             frag = frag_trace["text"]
+                            if is_hotword_run(frag, hotwords_all + glossary.hotwords):
+                                print(f"[asr] dropped hotword run: {frag}", file=sys.stderr)
+                                packet_dropped = True
+                                for task in draft_tasks:
+                                    task.cancel()
+                                draft_tasks.clear()
+                                last_live_line["text"] = ""
+                                last_draft_result.update(text="", source="", src="", time=0.0)
+                                if ui:
+                                    await ui.emit({"type": "interim", "text": ""})
+                                    await ui.emit({"type": "draft", "text": ""})
+                                continue
                             if (replay_guard["remaining"] > 0
                                     and loop.time() < replay_guard["until"]):
                                 replay_guard["remaining"] -= 1
@@ -2716,7 +2908,7 @@ async def _run(args, stamp: str) -> None:
                     # same ASR packet. Once that utterance committed, treating
                     # the repeated text as a new partial launches a stale draft
                     # after the committed event has already cleared the strip.
-                    packet_committed = seg_seq != packet_seg_seq
+                    packet_committed = seg_seq != packet_seg_seq or packet_dropped
                     if line_parts or (event.text and not packet_committed):
                         live_trace = traced("" if packet_committed else event.text)
                         if reconnect_partial["text"] and not line_parts:
@@ -2726,6 +2918,15 @@ async def _run(args, stamp: str) -> None:
                         line = live_trace["text"]
                         last_live_line.update(live_trace)
                         text = line.strip()
+                        if is_hotword_run(text, hotwords_all + glossary.hotwords):
+                            line = text = ""
+                            last_live_line["text"] = ""
+                            for task in draft_tasks:
+                                task.cancel()
+                            draft_tasks.clear()
+                            last_draft_result.update(text="", source="", src="", time=0.0)
+                            if ui:
+                                await ui.emit({"type": "draft", "text": "", "lang": ""})
                         now = asyncio.get_running_loop().time()
                         # Draft budget: QPM is per-account and reserved for
                         # drafts. Fire at most every 0.6s, and skip when the
@@ -2833,9 +3034,8 @@ async def _run(args, stamp: str) -> None:
         producer.cancel()
         watchdog.cancel()
         cleanup_tasks = [producer, watchdog]
-        if share_task:
-            share_task.cancel()  # terminates an in-flight cloudflared too
-            cleanup_tasks.append(share_task)
+        if sharing:
+            cleanup_tasks.append(asyncio.create_task(sharing.close()))
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
         for task in draft_tasks:
             task.cancel()
@@ -2870,21 +3070,8 @@ async def _run(args, stamp: str) -> None:
                 print_safe(f"[corrections] cannot persist: {e}", file=sys.stderr)
         if transcript_records:
             md_path = jsonl_path.replace(".jsonl", ".md")
-            used_pairs = list(dict.fromkeys(
-                record.get("pair", "zh-en") for record in transcript_records
-            ))
-            pair_label = (used_pairs[0] if len(used_pairs) == 1
-                          else f"mixed ({', '.join(used_pairs)})")
-            lines = [f"# Babel transcript {stamp}\n\nPair: {pair_label}\n\n"]
-            for r in transcript_records:
-                who = (f"Speaker {int(r['speaker']) + 1}"
-                       if r["speaker"] is not None and str(r["speaker"]).isdigit()
-                       else r["speaker"] or "")
-                when = r.get("time", "")
-                lines.append(f"**{who}** ({r['lang']}) [{when}]: {r['source']}\n\n"
-                             f"> {r['translation']}\n\n")
             try:
-                _atomic_write_text(md_path, "".join(lines))
+                _atomic_write_text(md_path, transcript_markdown(transcript_records, stamp))
                 print_safe(f"[transcript] saved {jsonl_path} and {md_path}")
             except OSError as e:
                 print_safe(f"[transcript] cannot save Markdown: {e}", file=sys.stderr)
